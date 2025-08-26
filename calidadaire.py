@@ -1,13 +1,12 @@
-# Daniel Poleo Brito
 # app.py
-# Visor mensual 2x2 centrado con bandas ICCA (PM1/PM2.5/PM10, NO2, SO2, O3)
-# Fuente de datos: carpeta de GitHub (contents API / raw URLs)
+# Visor mensual 2x2 con bandas ICCA (PM1/PM2.5/PM10, NO2, SO2, O3)
+# Fuente: carpeta de GitHub (Contents API / raw URLs)
 # Requisitos: streamlit, pandas, plotly, requests, python-dateutil (implícito)
 
-import re
-import math
 import io
 import os
+import re
+import math
 from datetime import datetime
 from typing import Dict, List, Optional, Tuple
 
@@ -16,14 +15,14 @@ import pandas as pd
 import streamlit as st
 import plotly.graph_objects as go
 
-# ============== CONFIG POR DEFECTO (puedes cambiar en la barra lateral) ==============
+# =================== CONFIG POR DEFECTO ===================
 DEFAULT_GITHUB_OWNER = "danipoleo"
 DEFAULT_GITHUB_REPO  = "calidadaire"
 DEFAULT_PATH_IN_REPO = "datos"
-DEFAULT_BRANCH       = "main"  # cámbialo si tu branch es otro
-# =====================================================================================
+DEFAULT_BRANCH       = "main"
+# ==========================================================
 
-# ------------------ Mapeo de estaciones (opcional, edítalo a gusto) ------------------
+# ------------------ Mapeo de estaciones -------------------
 STATION_MAP: Dict[str, str] = {
     "1637": "San José",
     "1653": "Cigefi",
@@ -56,10 +55,36 @@ COL_CANDIDATES: Dict[str, List[str]] = {
     "PM10_UNIT":["PM10 Unit", "PM10 units"],
 }
 
-# Regex del nombre de archivo: device_<sid>_<YYYYMMDDHHMM>_<YYYYMMDDHHMM>_1hr.csv
+# ============ Regex y parser del nombre de archivo ============
 FILENAME_REGEX = re.compile(
     r"^device_(?P<sid>[A-Za-z0-9]+)_(?P<start>\d{12})_(?P<end>\d{12})_1hr\.csv$"
 )
+
+def parse_from_filename(name: str):
+    """
+    Extrae sid, dt_start, dt_end, year, month desde:
+    'device_<sid>_<YYYYMMDDHHMM>_<YYYYMMDDHHMM>_1hr.csv'.
+    Si no coincide, devuelve claves con None.
+    """
+    m = FILENAME_REGEX.match(name or "")
+    if not m:
+        return {"sid": None, "dt_start": None, "dt_end": None, "year": None, "month": None}
+    sid = m.group("sid")
+    start = m.group("start")
+    end   = m.group("end")
+    try:
+        dt_start = datetime.strptime(start, "%Y%m%d%H%M")
+        dt_end   = datetime.strptime(end,   "%Y%m%d%H%M")
+        return {
+            "sid": sid,
+            "dt_start": dt_start,
+            "dt_end": dt_end,
+            "year": dt_start.year,
+            "month": dt_start.month
+        }
+    except Exception:
+        return {"sid": sid, "dt_start": None, "dt_end": None, "year": None, "month": None}
+# =============================================================
 
 # ---------- ICCA (rangos base) ----------
 ICCA: Dict[str, List[Tuple[str, str, float, float]]] = {
@@ -130,28 +155,12 @@ def find_column(df: pd.DataFrame, options: List[str]) -> Optional[str]:
                 return real
     return None
 
-def parse_from_filename(name: str):
-    """Extrae sid, dt_start, dt_end, year, month desde 'device_<sid>_<YYYYMMDDHHMM>_<YYYYMMDDHHMM>_1hr.csv'."""
-    m = FILENAME_REGEX.match(name or "")
-    if not m:
-        return {"sid": None, "dt_start": None, "dt_end": None, "year": None, "month": None}
-    sid = m.group("sid")
-    start = m.group("start")
-    end   = m.group("end")
-    try:
-        dt_start = datetime.strptime(start, "%Y%m%d%H%M")
-        dt_end   = datetime.strptime(end,   "%Y%m%d%H%M")
-        return {"sid": sid, "dt_start": dt_start, "dt_end": dt_end, "year": dt_start.year, "month": dt_start.month}
-    except Exception:
-        return {"sid": sid, "dt_start": None, "dt_end": None, "year": None, "month": None}
-
 def _clean_earthsense_text(txt: str) -> str:
     """
     Devuelve SOLO la parte útil del CSV: desde la fila de encabezados reales
     ('Date (Local)', 'UTC Time Stamp', ...) hacia abajo.
     También descarta líneas sueltas/rotas que no tengan suficientes comas.
     """
-    # normalizar saltos de línea y quitar BOM si hubiera
     txt = txt.replace("\r\n", "\n").replace("\r", "\n")
     if txt.startswith("\ufeff"):
         txt = txt.lstrip("\ufeff")
@@ -165,21 +174,16 @@ def _clean_earthsense_text(txt: str) -> str:
             break
 
     if header_idx is None:
-        # Si no encuentro la cabecera, retorno el texto original
-        return txt
+        return txt  # no encontré cabecera — leer tal cual
 
-    # Conservar desde el header real en adelante
     useful = lines[header_idx:]
-
-    # Filtrar líneas obviamente rotas: se requieren al menos 5 comas (6 campos)
     filtered = [ln for ln in useful if ln.count(",") >= 5 or ln.strip().lower().startswith("date (local)")]
-
     return "\n".join(filtered)
 
 @st.cache_data(ttl=300, show_spinner=False)
 def fetch_csv(url: str) -> pd.DataFrame:
     """
-    Descarga y lee un CSV con metadatos arriba (EarthSense).
+    Descarga y lee un CSV tipo EarthSense con metadatos arriba.
     Usa engine='python' y on_bad_lines='skip' para tolerar líneas raras.
     """
     r = requests.get(url, headers=_gh_headers(), timeout=60)
@@ -192,7 +196,7 @@ def fetch_csv(url: str) -> pd.DataFrame:
 
     clean_txt = _clean_earthsense_text(txt)
 
-    # Intento principal: coma como separador
+    # Intento principal: separador ','
     try:
         return pd.read_csv(
             io.StringIO(clean_txt),
@@ -203,7 +207,7 @@ def fetch_csv(url: str) -> pd.DataFrame:
             na_values=["N/A", "NA", "", "null", "None"],
         )
     except Exception:
-        # Intento alterno: algunos exportes usan ';'
+        # Alterno: separador ';'
         return pd.read_csv(
             io.StringIO(clean_txt),
             engine="python",
@@ -229,7 +233,7 @@ def github_list_files(owner: str, repo: str, path: str, branch: str):
         if it.get("type") == "file" and it.get("name", "").lower().endswith(".csv"):
             files.append({
                 "name": it["name"],
-                "download_url": it.get("download_url"),  # raw directo
+                "download_url": it.get("download_url"),
                 "path": it.get("path"),
             })
     return files
@@ -362,15 +366,18 @@ if not files:
     st.error("No encontré CSV en esa carpeta del repositorio. Verifica owner/repo/ruta/branch.")
     st.stop()
 
-# Construir un índice e intentar parsear año/mes del nombre
+# Construir índice e intentar parsear año/mes del nombre
 rows = []
 for f in files:
-    meta = parse_from_filename(f["name"])
+    fname = f.get("name") or ""
+    if not fname:
+        continue
+    meta = parse_from_filename(fname)
     sid = meta["sid"]
     station = STATION_MAP.get(sid, sid if sid else "Desconocida")
     rows.append({
-        "name": f["name"],
-        "url": f["download_url"] or raw_url(owner, repo, f["path"], branch),
+        "name": fname,
+        "url": f.get("download_url") or raw_url(owner, repo, f.get("path",""), branch),
         "sid": sid,
         "station": station,
         "dt_start": meta["dt_start"],
@@ -386,7 +393,6 @@ if files_df["year"].isna().any() or files_df["month"].isna().any():
     for i, r in need_rows.iterrows():
         try:
             tmp = fetch_csv(r["url"])
-            # determinar dt
             col_utc  = find_column(tmp, COL_CANDIDATES["UTC"])
             col_date = find_column(tmp, COL_CANDIDATES["DATE"])
             col_time = find_column(tmp, COL_CANDIDATES["TIME"])
@@ -566,4 +572,3 @@ with st.expander("Ayuda / Supuestos"):
 - Conversión (25°C, 1 atm): µg/m³ = ppm × MW × 1000 / 24.45; mg/m³ = ppm × MW / 24.45.
 - Si el nombre del archivo cumple `device_<id>_<YYYYMMDDHHMM>_<YYYYMMDDHHMM>_1hr.csv`, se usa para inferir Año/Mes; de lo contrario, se estima desde las fechas del CSV.
 """)
-
