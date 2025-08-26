@@ -1,4 +1,5 @@
 # Daniel Poleo Brito
+# app.py
 # Visor mensual 2x2 centrado con bandas ICCA (PM1/PM2.5/PM10, NO2, SO2, O3)
 # Fuente de datos: carpeta de GitHub (contents API / raw URLs)
 # Requisitos: streamlit, pandas, plotly, python-dateutil, requests
@@ -532,3 +533,4 @@ with st.expander("Ayuda / Supuestos"):
 - Conversión (25°C, 1 atm): µg/m³ = ppm × MW × 1000 / 24.45; mg/m³ = ppm × MW / 24.45.
 - Si el nombre del archivo cumple `device_<id>_<YYYYMMDDHHMM>_<YYYYMMDDHHMM>_1hr.csv`, se usa para inferir Año/Mes; de lo contrario, se estima desde las fechas del CSV.
 """)
+
