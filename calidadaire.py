@@ -130,6 +130,21 @@ def find_column(df: pd.DataFrame, options: List[str]) -> Optional[str]:
                 return real
     return None
 
+def parse_from_filename(name: str):
+    """Extrae sid, dt_start, dt_end, year, month desde 'device_<sid>_<YYYYMMDDHHMM>_<YYYYMMDDHHMM>_1hr.csv'."""
+    m = FILENAME_REGEX.match(name or "")
+    if not m:
+        return {"sid": None, "dt_start": None, "dt_end": None, "year": None, "month": None}
+    sid = m.group("sid")
+    start = m.group("start")
+    end   = m.group("end")
+    try:
+        dt_start = datetime.strptime(start, "%Y%m%d%H%M")
+        dt_end   = datetime.strptime(end,   "%Y%m%d%H%M")
+        return {"sid": sid, "dt_start": dt_start, "dt_end": dt_end, "year": dt_start.year, "month": dt_start.month}
+    except Exception:
+        return {"sid": sid, "dt_start": None, "dt_end": None, "year": None, "month": None}
+
 def _clean_earthsense_text(txt: str) -> str:
     """
     Devuelve SOLO la parte útil del CSV: desde la fila de encabezados reales
