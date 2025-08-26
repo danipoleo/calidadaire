@@ -2,7 +2,7 @@
 # app.py
 # Visor mensual 2x2 centrado con bandas ICCA (PM1/PM2.5/PM10, NO2, SO2, O3)
 # Fuente de datos: carpeta de GitHub (contents API / raw URLs)
-# Requisitos: streamlit, pandas, plotly, python-dateutil, requests
+# Requisitos: streamlit, pandas, plotly, requests, python-dateutil (implícito)
 
 import re
 import math
@@ -14,23 +14,7 @@ from typing import Dict, List, Optional, Tuple
 import requests
 import pandas as pd
 import streamlit as st
-
-# ---------- Auto-instalar plotly si falta (útil en Streamlit Cloud si no leyó requirements) ----------
-def _ensure_plotly():
-    try:
-        import plotly.graph_objects as go  # noqa
-        return go
-    except ModuleNotFoundError:
-        import sys, subprocess
-        try:
-            subprocess.check_call([sys.executable, "-m", "pip", "install", "plotly>=5.22.0"])
-            import plotly.graph_objects as go  # noqa
-            return go
-        except Exception as e:
-            st.error(f"No se pudo instalar Plotly automáticamente. Detalle: {e}")
-            raise
-go = _ensure_plotly()
-# -----------------------------------------------------------------------------------------------------
+import plotly.graph_objects as go
 
 # ============== CONFIG POR DEFECTO (puedes cambiar en la barra lateral) ==============
 DEFAULT_GITHUB_OWNER = "danipoleo"
@@ -127,7 +111,7 @@ MW = {"NO2": 46.01, "O3": 48.00, "SO2": 64.07, "CO": 28.01}
 # ========================== Utilidades ==========================
 
 def _gh_headers() -> Dict[str, str]:
-    """Headers opcionales con token para evitar rate-limits en GitHub."""
+    """Headers opcionales con token para evitar rate-limits en GitHub (Streamlit Secrets o env)."""
     token = st.secrets.get("GITHUB_TOKEN", None) or os.environ.get("GITHUB_TOKEN", None)
     return {"Authorization": f"Bearer {token}"} if token else {}
 
@@ -146,22 +130,76 @@ def find_column(df: pd.DataFrame, options: List[str]) -> Optional[str]:
                 return real
     return None
 
-def _try_read_csv(content: bytes) -> pd.DataFrame:
-    """Intentos robustos de lectura de CSV."""
-    # 1) pandas directo
-    try:
-        return pd.read_csv(io.BytesIO(content), na_values=["N/A","NA","","null","None"])
-    except Exception:
-        pass
-    # 2) ; como separador
-    txt = content.decode("utf-8", errors="ignore")
-    if txt.count(";") > txt.count(","):
-        return pd.read_csv(io.StringIO(txt), sep=";", na_values=["N/A","NA","","null","None"])
-    # 3) reemplazo simple de ';'→',' si viniera mezclado
-    return pd.read_csv(io.StringIO(txt.replace(";", ",")), na_values=["N/A","NA","","null","None"])
+def _clean_earthsense_text(txt: str) -> str:
+    """
+    Devuelve SOLO la parte útil del CSV: desde la fila de encabezados reales
+    ('Date (Local)', 'UTC Time Stamp', ...) hacia abajo.
+    También descarta líneas sueltas/rotas que no tengan suficientes comas.
+    """
+    # normalizar saltos de línea y quitar BOM si hubiera
+    txt = txt.replace("\r\n", "\n").replace("\r", "\n")
+    if txt.startswith("\ufeff"):
+        txt = txt.lstrip("\ufeff")
+
+    lines = txt.split("\n")
+    header_idx = None
+    for i, line in enumerate(lines):
+        l = line.strip('"').lower()
+        if "date (local)" in l and "utc time stamp" in l:
+            header_idx = i
+            break
+
+    if header_idx is None:
+        # Si no encuentro la cabecera, retorno el texto original
+        return txt
+
+    # Conservar desde el header real en adelante
+    useful = lines[header_idx:]
+
+    # Filtrar líneas obviamente rotas: se requieren al menos 5 comas (6 campos)
+    filtered = [ln for ln in useful if ln.count(",") >= 5 or ln.strip().lower().startswith("date (local)")]
+
+    return "\n".join(filtered)
 
 @st.cache_data(ttl=300, show_spinner=False)
-def github_list_files(owner: str, repo: str, path: str, branch: str) -> List[Dict[str, str]]:
+def fetch_csv(url: str) -> pd.DataFrame:
+    """
+    Descarga y lee un CSV con metadatos arriba (EarthSense).
+    Usa engine='python' y on_bad_lines='skip' para tolerar líneas raras.
+    """
+    r = requests.get(url, headers=_gh_headers(), timeout=60)
+    r.raise_for_status()
+    # decodificar como texto
+    try:
+        txt = r.content.decode("utf-8")
+    except UnicodeDecodeError:
+        txt = r.content.decode("latin-1", errors="replace")
+
+    clean_txt = _clean_earthsense_text(txt)
+
+    # Intento principal: coma como separador
+    try:
+        return pd.read_csv(
+            io.StringIO(clean_txt),
+            engine="python",
+            sep=",",
+            quotechar='"',
+            on_bad_lines="skip",
+            na_values=["N/A", "NA", "", "null", "None"],
+        )
+    except Exception:
+        # Intento alterno: algunos exportes usan ';'
+        return pd.read_csv(
+            io.StringIO(clean_txt),
+            engine="python",
+            sep=";",
+            quotechar='"',
+            on_bad_lines="skip",
+            na_values=["N/A", "NA", "", "null", "None"],
+        )
+
+@st.cache_data(ttl=300, show_spinner=False)
+def github_list_files(owner: str, repo: str, path: str, branch: str):
     """Lista archivos (GitHub contents API) en una carpeta."""
     url = f"https://api.github.com/repos/{owner}/{repo}/contents/{path}?ref={branch}"
     r = requests.get(url, headers=_gh_headers(), timeout=30)
@@ -183,28 +221,6 @@ def github_list_files(owner: str, repo: str, path: str, branch: str) -> List[Dic
 
 def raw_url(owner: str, repo: str, path: str, branch: str) -> str:
     return f"https://raw.githubusercontent.com/{owner}/{repo}/{branch}/{path}"
-
-@st.cache_data(ttl=300, show_spinner=False)
-def fetch_csv(url: str) -> pd.DataFrame:
-    """Descarga y lee un CSV desde una URL."""
-    r = requests.get(url, headers=_gh_headers(), timeout=60)
-    r.raise_for_status()
-    return _try_read_csv(r.content)
-
-def parse_from_filename(name: str) -> Dict[str, Optional[object]]:
-    """Intenta extraer sid, start, end, year, month desde el nombre; si falla, devuelve parciales."""
-    m = FILENAME_REGEX.match(name)
-    if not m:
-        return {"sid": None, "dt_start": None, "dt_end": None, "year": None, "month": None}
-    sid = m.group("sid")
-    start = m.group("start")
-    end   = m.group("end")
-    try:
-        dt_start = datetime.strptime(start, "%Y%m%d%H%M")
-        dt_end   = datetime.strptime(end,   "%Y%m%d%H%M")
-        return {"sid": sid, "dt_start": dt_start, "dt_end": dt_end, "year": dt_start.year, "month": dt_start.month}
-    except Exception:
-        return {"sid": sid, "dt_start": None, "dt_end": None, "year": None, "month": None}
 
 def unit_from_column(df: pd.DataFrame, unit_col: Optional[str], default: str) -> str:
     if unit_col and unit_col in df.columns:
@@ -320,7 +336,7 @@ with st.sidebar:
         except Exception:
             st.warning("No pude interpretar la URL; usando los campos owner/repo/ruta/branch.")
 
-# Listar archivos CSV en la carpeta
+# --- Listar archivos CSV en la carpeta (robusto) ---
 try:
     files = github_list_files(owner, repo, path, branch)
 except Exception as e:
@@ -331,7 +347,7 @@ if not files:
     st.error("No encontré CSV en esa carpeta del repositorio. Verifica owner/repo/ruta/branch.")
     st.stop()
 
-# Construir un índice tipo "scan_files", intentando parsear del nombre; si no, estimar después
+# Construir un índice e intentar parsear año/mes del nombre
 rows = []
 for f in files:
     meta = parse_from_filename(f["name"])
@@ -349,12 +365,13 @@ for f in files:
     })
 files_df = pd.DataFrame(rows)
 
-# Si no pudimos extraer año/mes desde el nombre, intentamos con el primer/último timestamp del CSV
+# Si no pudimos extraer año/mes desde el nombre, inferir desde el CSV
 if files_df["year"].isna().any() or files_df["month"].isna().any():
     need_rows = files_df[files_df["year"].isna() | files_df["month"].isna()]
     for i, r in need_rows.iterrows():
         try:
             tmp = fetch_csv(r["url"])
+            # determinar dt
             col_utc  = find_column(tmp, COL_CANDIDATES["UTC"])
             col_date = find_column(tmp, COL_CANDIDATES["DATE"])
             col_time = find_column(tmp, COL_CANDIDATES["TIME"])
@@ -511,8 +528,8 @@ with st.expander("Estadísticas del mes (valores originales)"):
     )
 
 # Descarga del CSV limpio
-safe_year = int(row['year']) if pd.notna(row['year']) else None
-safe_month = int(row['month']) if pd.notna(row['month']) else None
+safe_year = int(subset.iloc[0]['year']) if pd.notna(subset.iloc[0]['year']) else None
+safe_month = int(subset.iloc[0]['month']) if pd.notna(subset.iloc[0]['month']) else None
 file_stub = f"clean_{row.get('sid') or 'NA'}_{safe_year or 'YYYY'}{(safe_month or 0):02d if safe_month else 'MM'}"
 
 st.download_button(
@@ -525,11 +542,12 @@ st.download_button(
 with st.expander("Ayuda / Supuestos"):
     st.markdown(f"""
 - Fuente: GitHub contents API → descarga directa **raw** (usa `GITHUB_TOKEN` si está disponible para evitar límites).
-- Detección de tiempo: **UTC Time Stamp** si existe; si no, **Date (Local) + Time (Local)** (interpreta día/mes con `dayfirst=True`).
+- Limpieza EarthSense: se descartan metadatos superiores hasta encontrar la fila con **Date (Local)** y **UTC Time Stamp**.
+- Detección de tiempo: **UTC Time Stamp** si existe; si no, **Date (Local) + Time (Local)** (`dayfirst=True`).
 - **Bandas ICCA**:
   - **Particulados** (PM10 y PM2.5) en **µg/m³** (rangos incluidos en el código).
   - **Gases (NO₂, O₃, SO₂)**: ICCA en **ppm**, convertido automáticamente a la **unidad del CSV**:
-    - NO₂ ({no2_unit}), O₃ ({o3_unit}), SO₂ ({so2_unit}); CO soportado si llega a estar disponible.
+    - NO₂ ({no2_unit}), O₃ ({o3_unit}), SO₂ ({so2_unit}); CO soportado si está en el CSV.
 - Conversión (25°C, 1 atm): µg/m³ = ppm × MW × 1000 / 24.45; mg/m³ = ppm × MW / 24.45.
 - Si el nombre del archivo cumple `device_<id>_<YYYYMMDDHHMM>_<YYYYMMDDHHMM>_1hr.csv`, se usa para inferir Año/Mes; de lo contrario, se estima desde las fechas del CSV.
 """)
