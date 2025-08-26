@@ -1,4 +1,4 @@
-# Daniel Poleo
+# Daniel Poleo Brito
 # Visor mensual 2x2 centrado con bandas ICCA (PM1/PM2.5/PM10, NO2, SO2, O3)
 # Fuente de datos: carpeta de GitHub (contents API / raw URLs)
 # Requisitos: streamlit, pandas, plotly, python-dateutil, requests
@@ -6,7 +6,6 @@
 import re
 import math
 import io
-import json
 import os
 from datetime import datetime
 from typing import Dict, List, Optional, Tuple
@@ -14,7 +13,23 @@ from typing import Dict, List, Optional, Tuple
 import requests
 import pandas as pd
 import streamlit as st
-import plotly.graph_objects as go
+
+# ---------- Auto-instalar plotly si falta (útil en Streamlit Cloud si no leyó requirements) ----------
+def _ensure_plotly():
+    try:
+        import plotly.graph_objects as go  # noqa
+        return go
+    except ModuleNotFoundError:
+        import sys, subprocess
+        try:
+            subprocess.check_call([sys.executable, "-m", "pip", "install", "plotly>=5.22.0"])
+            import plotly.graph_objects as go  # noqa
+            return go
+        except Exception as e:
+            st.error(f"No se pudo instalar Plotly automáticamente. Detalle: {e}")
+            raise
+go = _ensure_plotly()
+# -----------------------------------------------------------------------------------------------------
 
 # ============== CONFIG POR DEFECTO (puedes cambiar en la barra lateral) ==============
 DEFAULT_GITHUB_OWNER = "danipoleo"
@@ -112,18 +127,16 @@ MW = {"NO2": 46.01, "O3": 48.00, "SO2": 64.07, "CO": 28.01}
 
 def _gh_headers() -> Dict[str, str]:
     """Headers opcionales con token para evitar rate-limits en GitHub."""
-    token = st.secrets.get("GITHUB_TOKEN", None)
-    if not token:
-        token = os.environ.get("GITHUB_TOKEN", None)
+    token = st.secrets.get("GITHUB_TOKEN", None) or os.environ.get("GITHUB_TOKEN", None)
     return {"Authorization": f"Bearer {token}"} if token else {}
 
 def find_column(df: pd.DataFrame, options: List[str]) -> Optional[str]:
-    # Coincidencia exacta (insensible a may/min y espacios)
+    # Coincidencia exacta
     for candidate in options:
         for col in df.columns:
             if col.strip().lower() == candidate.strip().lower():
                 return col
-    # Coincidencia parcial tolerante
+    # Coincidencia parcial
     lower_cols = {c.lower(): c for c in df.columns}
     for candidate in options:
         c = candidate.strip().lower()
@@ -139,16 +152,12 @@ def _try_read_csv(content: bytes) -> pd.DataFrame:
         return pd.read_csv(io.BytesIO(content), na_values=["N/A","NA","","null","None"])
     except Exception:
         pass
-    # 2) separador ; y coma decimal → reemplazo
-    try:
-        txt = content.decode("utf-8", errors="ignore")
-        # Si muchas ; están presentes, probamos sep=';'
-        if txt.count(";") > txt.count(","):
-            return pd.read_csv(io.StringIO(txt), sep=";", na_values=["N/A","NA","","null","None"])
-        # Si hay coma decimal, intentamos reemplazo conservador
-        return pd.read_csv(io.StringIO(txt.replace(";", ",")), na_values=["N/A","NA","","null","None"])
-    except Exception as e:
-        raise e
+    # 2) ; como separador
+    txt = content.decode("utf-8", errors="ignore")
+    if txt.count(";") > txt.count(","):
+        return pd.read_csv(io.StringIO(txt), sep=";", na_values=["N/A","NA","","null","None"])
+    # 3) reemplazo simple de ';'→',' si viniera mezclado
+    return pd.read_csv(io.StringIO(txt.replace(";", ",")), na_values=["N/A","NA","","null","None"])
 
 @st.cache_data(ttl=300, show_spinner=False)
 def github_list_files(owner: str, repo: str, path: str, branch: str) -> List[Dict[str, str]]:
@@ -156,7 +165,7 @@ def github_list_files(owner: str, repo: str, path: str, branch: str) -> List[Dic
     url = f"https://api.github.com/repos/{owner}/{repo}/contents/{path}?ref={branch}"
     r = requests.get(url, headers=_gh_headers(), timeout=30)
     if r.status_code == 403:
-        st.warning("Límite de API de GitHub alcanzado. Intenta con un GITHUB_TOKEN en Secrets.")
+        st.warning("Límite de API de GitHub alcanzado. Agrega un GITHUB_TOKEN en Secrets si es posible.")
     r.raise_for_status()
     items = r.json()
     if isinstance(items, dict) and items.get("type") == "file":
@@ -301,7 +310,6 @@ with st.sidebar:
     gh_url = st.text_input("URL de carpeta (opcional)", value="", placeholder="https://github.com/owner/repo/tree/branch/carpeta")
     if gh_url.strip():
         try:
-            # Soporta formatos típicos: ...github.com/<owner>/<repo>/tree/<branch>/<path...>
             parts = gh_url.strip().split("github.com/")[-1].split("/")
             owner = parts[0]; repo = parts[1]
             idx_tree = parts.index("tree") if "tree" in parts else -1
@@ -346,7 +354,6 @@ if files_df["year"].isna().any() or files_df["month"].isna().any():
     for i, r in need_rows.iterrows():
         try:
             tmp = fetch_csv(r["url"])
-            # determinar dt
             col_utc  = find_column(tmp, COL_CANDIDATES["UTC"])
             col_date = find_column(tmp, COL_CANDIDATES["DATE"])
             col_time = find_column(tmp, COL_CANDIDATES["TIME"])
