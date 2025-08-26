@@ -1,4 +1,4 @@
-# app.py
+# Daniel Poleo
 # Visor mensual 2x2 centrado con bandas ICCA (PM1/PM2.5/PM10, NO2, SO2, O3)
 # Fuente de datos: carpeta de GitHub (contents API / raw URLs)
 # Requisitos: streamlit, pandas, plotly, python-dateutil, requests
@@ -7,8 +7,11 @@ import re
 import math
 import io
 import json
-import requests
+import os
 from datetime import datetime
+from typing import Dict, List, Optional, Tuple
+
+import requests
 import pandas as pd
 import streamlit as st
 import plotly.graph_objects as go
@@ -21,7 +24,7 @@ DEFAULT_BRANCH       = "main"  # cámbialo si tu branch es otro
 # =====================================================================================
 
 # ------------------ Mapeo de estaciones (opcional, edítalo a gusto) ------------------
-STATION_MAP = {
+STATION_MAP: Dict[str, str] = {
     "1637": "San José",
     "1653": "Cigefi",
     "1735": "Cartago TEC",
@@ -32,7 +35,7 @@ STATION_MAP = {
 }
 
 # Columnas posibles (nombres varían por exporte)
-COL_CANDIDATES = {
+COL_CANDIDATES: Dict[str, List[str]] = {
     "PM1":   ["PM1 Concentration", "PM1"],
     "PM25":  ["PM2.5 Concentration", "PM2.5", "PM2_5", "PM25"],
     "PM10":  ["PM10 Concentration", "PM10"],
@@ -40,17 +43,17 @@ COL_CANDIDATES = {
     "SO2":   ["SO2 Concentration", "SO2", "SO₂"],
     "O3":    ["O3 Concentration",  "O3", "Ozone", "O₃"],
     "CO":    ["CO Concentration",  "CO"],
-    "DATE":  ["Date (Local)", "Date"],
-    "TIME":  ["Time (Local)", "Time"],
-    "UTC":   ["UTC Time Stamp", "UTC", "Timestamp"],
+    "DATE":  ["Date (Local)", "Date", "Fecha"],
+    "TIME":  ["Time (Local)", "Time", "Hora"],
+    "UTC":   ["UTC Time Stamp", "UTC", "Timestamp", "Datetime", "DateTime"],
     # Columnas de unidades (si existen)
-    "NO2_UNIT": ["NO2 Unit", "NO₂ Unit", "NO2_Unit"],
-    "SO2_UNIT": ["SO2 Unit", "SO₂ Unit", "SO2_Unit"],
-    "O3_UNIT":  ["O3 Unit",  "O₃ Unit",  "O3_Unit"],
-    "CO_UNIT":  ["CO Unit", "CO_Unit"],
-    "PM1_UNIT": ["PM1 Unit"],
-    "PM25_UNIT":["PM2.5 Unit", "PM2_5 Unit", "PM25 Unit"],
-    "PM10_UNIT":["PM10 Unit"],
+    "NO2_UNIT": ["NO2 Unit", "NO₂ Unit", "NO2_Unit", "NO2 units"],
+    "SO2_UNIT": ["SO2 Unit", "SO₂ Unit", "SO2_Unit", "SO2 units"],
+    "O3_UNIT":  ["O3 Unit",  "O₃ Unit",  "O3_Unit",  "O3 units"],
+    "CO_UNIT":  ["CO Unit", "CO_Unit", "CO units"],
+    "PM1_UNIT": ["PM1 Unit", "PM1 units"],
+    "PM25_UNIT":["PM2.5 Unit", "PM2_5 Unit", "PM25 Unit", "PM2.5 units"],
+    "PM10_UNIT":["PM10 Unit", "PM10 units"],
 }
 
 # Regex del nombre de archivo: device_<sid>_<YYYYMMDDHHMM>_<YYYYMMDDHHMM>_1hr.csv
@@ -59,7 +62,7 @@ FILENAME_REGEX = re.compile(
 )
 
 # ---------- ICCA (rangos base) ----------
-ICCA = {
+ICCA: Dict[str, List[Tuple[str, str, float, float]]] = {
     "PM10": [
         ("Verde",      "#00A65A", 0,    60),
         ("Amarillo",   "#FFC107", 61,   100),
@@ -106,11 +109,21 @@ ICCA = {
 MW = {"NO2": 46.01, "O3": 48.00, "SO2": 64.07, "CO": 28.01}
 
 # ========================== Utilidades ==========================
-def find_column(df, options):
+
+def _gh_headers() -> Dict[str, str]:
+    """Headers opcionales con token para evitar rate-limits en GitHub."""
+    token = st.secrets.get("GITHUB_TOKEN", None)
+    if not token:
+        token = os.environ.get("GITHUB_TOKEN", None)
+    return {"Authorization": f"Bearer {token}"} if token else {}
+
+def find_column(df: pd.DataFrame, options: List[str]) -> Optional[str]:
+    # Coincidencia exacta (insensible a may/min y espacios)
     for candidate in options:
         for col in df.columns:
             if col.strip().lower() == candidate.strip().lower():
                 return col
+    # Coincidencia parcial tolerante
     lower_cols = {c.lower(): c for c in df.columns}
     for candidate in options:
         c = candidate.strip().lower()
@@ -119,11 +132,31 @@ def find_column(df, options):
                 return real
     return None
 
-@st.cache_data(ttl=300)
-def github_list_files(owner, repo, path, branch):
+def _try_read_csv(content: bytes) -> pd.DataFrame:
+    """Intentos robustos de lectura de CSV."""
+    # 1) pandas directo
+    try:
+        return pd.read_csv(io.BytesIO(content), na_values=["N/A","NA","","null","None"])
+    except Exception:
+        pass
+    # 2) separador ; y coma decimal → reemplazo
+    try:
+        txt = content.decode("utf-8", errors="ignore")
+        # Si muchas ; están presentes, probamos sep=';'
+        if txt.count(";") > txt.count(","):
+            return pd.read_csv(io.StringIO(txt), sep=";", na_values=["N/A","NA","","null","None"])
+        # Si hay coma decimal, intentamos reemplazo conservador
+        return pd.read_csv(io.StringIO(txt.replace(";", ",")), na_values=["N/A","NA","","null","None"])
+    except Exception as e:
+        raise e
+
+@st.cache_data(ttl=300, show_spinner=False)
+def github_list_files(owner: str, repo: str, path: str, branch: str) -> List[Dict[str, str]]:
     """Lista archivos (GitHub contents API) en una carpeta."""
     url = f"https://api.github.com/repos/{owner}/{repo}/contents/{path}?ref={branch}"
-    r = requests.get(url, timeout=30)
+    r = requests.get(url, headers=_gh_headers(), timeout=30)
+    if r.status_code == 403:
+        st.warning("Límite de API de GitHub alcanzado. Intenta con un GITHUB_TOKEN en Secrets.")
     r.raise_for_status()
     items = r.json()
     if isinstance(items, dict) and items.get("type") == "file":
@@ -138,16 +171,17 @@ def github_list_files(owner, repo, path, branch):
             })
     return files
 
-def raw_url(owner, repo, path, branch):
+def raw_url(owner: str, repo: str, path: str, branch: str) -> str:
     return f"https://raw.githubusercontent.com/{owner}/{repo}/{branch}/{path}"
 
-@st.cache_data(ttl=300)
-def fetch_csv(url):
-    r = requests.get(url, timeout=60)
+@st.cache_data(ttl=300, show_spinner=False)
+def fetch_csv(url: str) -> pd.DataFrame:
+    """Descarga y lee un CSV desde una URL."""
+    r = requests.get(url, headers=_gh_headers(), timeout=60)
     r.raise_for_status()
-    return pd.read_csv(io.BytesIO(r.content), na_values=["N/A","NA","","null","None"])
+    return _try_read_csv(r.content)
 
-def parse_from_filename(name):
+def parse_from_filename(name: str) -> Dict[str, Optional[object]]:
     """Intenta extraer sid, start, end, year, month desde el nombre; si falla, devuelve parciales."""
     m = FILENAME_REGEX.match(name)
     if not m:
@@ -162,7 +196,7 @@ def parse_from_filename(name):
     except Exception:
         return {"sid": sid, "dt_start": None, "dt_end": None, "year": None, "month": None}
 
-def unit_from_column(df, unit_col, default):
+def unit_from_column(df: pd.DataFrame, unit_col: Optional[str], default: str) -> str:
     if unit_col and unit_col in df.columns:
         val = df[unit_col].dropna().astype(str)
         if len(val):
@@ -270,7 +304,6 @@ with st.sidebar:
             # Soporta formatos típicos: ...github.com/<owner>/<repo>/tree/<branch>/<path...>
             parts = gh_url.strip().split("github.com/")[-1].split("/")
             owner = parts[0]; repo = parts[1]
-            # saltar 'tree'
             idx_tree = parts.index("tree") if "tree" in parts else -1
             if idx_tree != -1 and len(parts) > idx_tree+1:
                 branch = parts[idx_tree+1]
@@ -279,7 +312,12 @@ with st.sidebar:
             st.warning("No pude interpretar la URL; usando los campos owner/repo/ruta/branch.")
 
 # Listar archivos CSV en la carpeta
-files = github_list_files(owner, repo, path, branch)
+try:
+    files = github_list_files(owner, repo, path, branch)
+except Exception as e:
+    st.error(f"No pude listar la carpeta en GitHub ({owner}/{repo}/{path}@{branch}). Detalle: {e}")
+    st.stop()
+
 if not files:
     st.error("No encontré CSV en esa carpeta del repositorio. Verifica owner/repo/ruta/branch.")
     st.stop()
@@ -356,7 +394,11 @@ row = subset[subset["label"] == station_label].iloc[0]
 st.caption(f"Archivo: `{row['name']}`  ·  Estación: **{row['station']}**  ·  Periodo: {row['dt_start']} → {row['dt_end']}")
 
 # Cargar CSV elegido
-df_raw = fetch_csv(row["url"])
+try:
+    df_raw = fetch_csv(row["url"])
+except Exception as e:
+    st.error(f"No pude descargar/leer el CSV: {row['url']}\nDetalle: {e}")
+    st.stop()
 
 # Resolver fecha/hora
 col_utc  = find_column(df_raw, COL_CANDIDATES["UTC"])
@@ -386,6 +428,7 @@ unit_cols = {
 no2_col = mapped.get("NO2")
 so2_col = mapped.get("SO2")
 o3_col  = mapped.get("O3")
+
 gases_missing = [name for name, col in {"NO₂": no2_col, "SO₂": so2_col, "O₃": o3_col}.items() if col is None]
 if gases_missing:
     st.error("El CSV no contiene: " + ", ".join(gases_missing))
@@ -460,17 +503,21 @@ with st.expander("Estadísticas del mes (valores originales)"):
     )
 
 # Descarga del CSV limpio
+safe_year = int(row['year']) if pd.notna(row['year']) else None
+safe_month = int(row['month']) if pd.notna(row['month']) else None
+file_stub = f"clean_{row.get('sid') or 'NA'}_{safe_year or 'YYYY'}{(safe_month or 0):02d if safe_month else 'MM'}"
+
 st.download_button(
     "Descargar CSV limpio (este archivo)",
     data=df.to_csv(index=False),
-    file_name=f"clean_{row.get('sid') or 'NA'}_{int(row['year']) if pd.notna(row['year']) else 'YYYY'}{int(row['month']):02d if pd.notna(row['month']) else 'MM'}.csv",
+    file_name=f"{file_stub}.csv",
     mime="text/csv"
 )
 
 with st.expander("Ayuda / Supuestos"):
     st.markdown(f"""
-- Fuente: GitHub contents API → descarga directa **raw**.
-- Detección de tiempo: **UTC Time Stamp** si existe; si no, **Date (Local) + Time (Local)**.
+- Fuente: GitHub contents API → descarga directa **raw** (usa `GITHUB_TOKEN` si está disponible para evitar límites).
+- Detección de tiempo: **UTC Time Stamp** si existe; si no, **Date (Local) + Time (Local)** (interpreta día/mes con `dayfirst=True`).
 - **Bandas ICCA**:
   - **Particulados** (PM10 y PM2.5) en **µg/m³** (rangos incluidos en el código).
   - **Gases (NO₂, O₃, SO₂)**: ICCA en **ppm**, convertido automáticamente a la **unidad del CSV**:
