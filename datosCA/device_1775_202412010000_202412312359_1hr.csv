@@ -1,0 +1,11 @@
+﻿"Averaging time data supplied by EarthSense on 27/01/2025"
+"Source",""
+"ID"," (1775)"
+"Site Name","1775"
+"Time Period","01/12/2024 00:00 - 31/12/2024 23:59"
+"Timestamp","31/12/2024 23:59 Local Time Zone Code Time Ending"
+"Averaging Period","1 Hour"
+"Slot B BIC","BIC3150"
+
+"Date (Local)","Time (Local)","UTC Time Stamp","Latitude","Longitude","NO2 Concentration","NO2 Unit","NO Concentration","NO Unit","O3 Concentration","O3 Unit","PM1 Concentration","PM1 Unit","PM2.5 Concentration","PM2.5 Unit","PM10 Concentration","PM10 Unit","SO2 Concentration","SO2 Unit","H2S Concentration","H2S Unit","CO Concentration","CO Unit","CO2 Concentration","CO2 Unit","TVOC Concentration","TVOC Unit","Temperature (°C)","Relative Humidity (%)","Measured (External) Wind Speed (m/s)","Measured (External) Wind Direction (°)","Measured (External) Rainfall (mm/hr)"
+
