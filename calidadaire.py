@@ -1,11 +1,13 @@
 # app.py
-# Visor mensual 2x2 (PM1/PM2.5/PM10, NO2, SO2, O3) con bandas ICCA
-# Fuente: carpeta en GitHub (HTML scraping y/o API) con caché robusto
+# Visor mensual 2x2 con bandas ICCA (PM1/PM2.5/PM10, NO2, SO2, O3)
+# Robusto contra rate limits: PRIORIDAD ZIP (codeload.github.com) -> HTML -> API
+# Lee TODOS los device_*_1hr.csv desde la carpeta indicada; si está vacía, auto-descubre en todo el repo
 
 import io
 import os
 import re
 import math
+import zipfile
 from datetime import datetime
 from typing import Dict, List, Optional, Tuple
 
@@ -17,7 +19,7 @@ import plotly.graph_objects as go
 # =================== CONFIG POR DEFECTO ===================
 DEFAULT_GITHUB_OWNER = "danipoleo"
 DEFAULT_GITHUB_REPO  = "calidadaire"
-DEFAULT_PATH_IN_REPO = "datosCA"  # cambia a "datos" si es tu carpeta
+DEFAULT_PATH_IN_REPO = "datos"       # ⇦ puedes poner "datosCA" si quieres por defecto
 DEFAULT_BRANCH       = "main"
 # ==========================================================
 
@@ -29,7 +31,7 @@ STATION_MAP: Dict[str, str] = {
     "1762": "Santa Lucía",
     "1775": "Belén CTP",
     "1776": "Fabio Baudrit",
-    "Z01777": "Municipalidad de Santa Ana",
+    "1777": "Municipalidad de Santa Ana",
 }
 
 # Columnas posibles (nombres varían por exporte)
@@ -102,7 +104,7 @@ def find_column(df: pd.DataFrame, options: List[str]) -> Optional[str]:
 
 def _clean_earthsense_text(txt: str) -> str:
     txt = txt.replace("\r\n", "\n").replace("\r", "\n")
-    if txt.startswith("\ufeff"):
+    if txt.startswith("\ufeff"):  # BOM
         txt = txt.lstrip("\ufeff")
     lines = txt.split("\n")
     header_idx = None
@@ -117,13 +119,12 @@ def _clean_earthsense_text(txt: str) -> str:
     return "\n".join(filtered)
 
 @st.cache_data(ttl=300, show_spinner=False)
-def fetch_csv(url: str) -> pd.DataFrame:
-    r = requests.get(url, headers=_gh_headers(), timeout=60)
-    r.raise_for_status()
+def fetch_csv_from_bytes(raw_bytes: bytes) -> pd.DataFrame:
+    # Lee CSV desde bytes (evita nuevas llamadas a Internet)
     try:
-        txt = r.content.decode("utf-8")
+        txt = raw_bytes.decode("utf-8")
     except UnicodeDecodeError:
-        txt = r.content.decode("latin-1", errors="replace")
+        txt = raw_bytes.decode("latin-1", errors="replace")
     clean_txt = _clean_earthsense_text(txt)
     try:
         return pd.read_csv(io.StringIO(clean_txt), engine="python", sep=",", quotechar='"',
@@ -132,7 +133,84 @@ def fetch_csv(url: str) -> pd.DataFrame:
         return pd.read_csv(io.StringIO(clean_txt), engine="python", sep=";", quotechar='"',
                            on_bad_lines="skip", na_values=["N/A","NA","","null","None"])
 
-# -------- Helpers para normalizar rutas del HTML/URLs --------
+@st.cache_data(ttl=300, show_spinner=False)
+def fetch_csv_http(url: str) -> pd.DataFrame:
+    r = requests.get(url, headers=_gh_headers(), timeout=60)
+    r.raise_for_status()
+    return fetch_csv_from_bytes(r.content)
+
+# -------- ZIP (PRIORIDAD) --------
+@st.cache_data(ttl=1800, show_spinner=False)
+def download_repo_zip(owner: str, repo: str, branch: str) -> bytes:
+    zip_url = f"https://codeload.github.com/{owner}/{repo}/zip/refs/heads/{branch}"
+    r = requests.get(zip_url, timeout=60)
+    r.raise_for_status()
+    return r.content
+
+def list_csvs_from_zip(zip_bytes: bytes, path: str, branch: str) -> List[dict]:
+    # Devuelve archivos .csv bajo "path" (si path vacío, busca en todo el repo)
+    zf = zipfile.ZipFile(io.BytesIO(zip_bytes))
+    root_prefix = None
+    # El zip expande como <repo>-<branch>/
+    for name in zf.namelist():
+        if name.endswith("/") and name.count("/") == 1:
+            root_prefix = name  # ej: calidadaire-main/
+            break
+    if not root_prefix:
+        root_prefix = f"{DEFAULT_GITHUB_REPO}-{branch}/"  # fallback
+
+    rel_folder = path.strip("/")
+    # Si path vacío, escanear todo el repo
+    wanted_prefix = (root_prefix + rel_folder + "/") if rel_folder else root_prefix
+
+    rows = []
+    for name in zf.namelist():
+        if not name.lower().endswith(".csv"):
+            continue
+        if rel_folder:
+            if not name.startswith(wanted_prefix):
+                continue
+        # Solo nombres device_*_1hr.csv (pero si quieres todos los .csv, comenta este if)
+        base = name.split("/")[-1]
+        if not FILENAME_REGEX.match(base):
+            continue
+        rel = name[len(root_prefix):]  # ruta relativa dentro del repo
+        rows.append({
+            "name": base,
+            "path": rel,  # p.ej: datos/device_...csv
+            "download_url": f"https://raw.githubusercontent.com/{owner}/{repo}/{branch}/{rel}",
+            "source": "zip"
+        })
+
+    return rows
+
+def autodiscover_device_csvs_zip(zip_bytes: bytes, branch: str) -> List[dict]:
+    # Busca device_* en TODO el repo (por si pusiste path mal o vacío)
+    zf = zipfile.ZipFile(io.BytesIO(zip_bytes))
+    root_prefix = None
+    for name in zf.namelist():
+        if name.endswith("/") and name.count("/") == 1:
+            root_prefix = name
+            break
+    if not root_prefix:
+        return []
+    rows = []
+    for name in zf.namelist():
+        if not name.lower().endswith(".csv"):
+            continue
+        base = name.split("/")[-1]
+        if not FILENAME_REGEX.match(base):
+            continue
+        rel = name[len(root_prefix):]
+        rows.append({
+            "name": base,
+            "path": rel,
+            "download_url": f"https://raw.githubusercontent.com/{owner}/{repo}/{branch}/{rel}",
+            "source": "zip_auto"
+        })
+    return rows
+
+# -------- HTML (fallback 1) --------
 def _normalize_rel_for_raw(rel: str, branch: str) -> str:
     if not rel: return rel
     rel = rel.lstrip("/")
@@ -143,22 +221,34 @@ def _normalize_rel_for_raw(rel: str, branch: str) -> str:
         rel = rel[len(prefix):]
     return rel
 
-def _to_tree_url_if_blob(url: str) -> str:
-    if not url: return url
-    u = url.split("?", 1)[0]
-    return u.replace("/blob/", "/tree/")
+def _extract_csv_links(html: str) -> List[str]:
+    return re.findall(r'href="([^"]+?/blob/[^"]+?\.csv[^"]*)"', html, flags=re.IGNORECASE)
 
-def _raw_from_blob_or_raw(owner: str, repo: str, branch: str, url: str) -> str:
-    if "raw.githubusercontent.com" in url:
-        return url.split("?", 1)[0]
-    if "/blob/" in url:
-        rel = url.split("/blob/", 1)[-1].split("?", 1)[0]
+def list_with_html(owner: str, repo: str, path: str, branch: str, plain: bool):
+    url = f"https://github.com/{owner}/{repo}/tree/{branch}/{path}".rstrip("/")
+    if plain:
+        url += "?plain=1"
+    r = requests.get(url, timeout=30)
+    if r.status_code >= 400:
+        return [], {"status": r.status_code, "where": "html_plain" if plain else "html"}
+    hrefs = _extract_csv_links(r.text)
+    sub = path.strip("/")
+    hrefs = [h for h in hrefs if (not sub) or (f"/{sub}/" in h) or h.endswith("/"+sub)]
+    files, seen = [], set()
+    for h in hrefs:
+        rel = h.split("/blob/", 1)[-1].split("?", 1)[0]
         rel = _normalize_rel_for_raw(rel, branch)
-        return f"https://raw.githubusercontent.com/{owner}/{repo}/{branch}/{rel}"
-    return url.split("?", 1)[0]
+        name = rel.split("/")[-1]
+        if not FILENAME_REGEX.match(name or ""):
+            continue
+        raw  = f"https://raw.githubusercontent.com/{owner}/{repo}/{branch}/{rel}"
+        if rel not in seen:
+            seen.add(rel)
+            files.append({"name": name, "download_url": raw, "path": rel, "source": "html"})
+    return files, {"status": r.status_code, "where": "html_plain" if plain else "html", "count": len(files)}
 
-# ------------- LISTADO DE ARCHIVOS EN GITHUB (múltiples estrategias) -------------
-def _list_with_git_tree(owner: str, repo: str, branch: str, subpath: str):
+# -------- API (fallback 2) --------
+def list_with_git_tree(owner: str, repo: str, branch: str, subpath: str):
     url = f"https://api.github.com/repos/{owner}/{repo}/git/trees/{branch}?recursive=1"
     try:
         r = requests.get(url, headers=_gh_headers(), timeout=30)
@@ -171,64 +261,19 @@ def _list_with_git_tree(owner: str, repo: str, branch: str, subpath: str):
         out  = []
         for node in tree:
             p = node.get("path", "")
-            if node.get("type") == "blob" and p.lower().endswith(".csv"):
+            name = p.split("/")[-1]
+            if node.get("type") == "blob" and name.lower().endswith(".csv"):
                 if not sub or p.startswith(sub + "/") or p == sub:
-                    name = p.split("/")[-1]
+                    if not FILENAME_REGEX.match(name or ""):
+                        continue
                     out.append({"name": name,
                                 "download_url": f"https://raw.githubusercontent.com/{owner}/{repo}/{branch}/{p}",
-                                "path": p})
+                                "path": p, "source": "git_tree"})
         return out, {"status": r.status_code, "where": "git_tree", "count": len(out)}
     except Exception as e:
         return [], {"status": "ERR", "where": "git_tree", "error": str(e)}
 
-def _extract_csv_links(html: str) -> List[str]:
-    return re.findall(r'href="([^"]+?/blob/[^"]+?\.csv[^"]*)"', html, flags=re.IGNORECASE)
-
-def _list_with_html_plain(owner: str, repo: str, path: str, branch: str):
-    url = f"https://github.com/{owner}/{repo}/tree/{branch}/{path}".rstrip("/") + "?plain=1"
-    try:
-        r = requests.get(url, timeout=30)
-        if r.status_code >= 400:
-            return [], {"status": r.status_code, "where": "html_plain"}
-        hrefs = _extract_csv_links(r.text)
-        sub = path.strip("/")
-        hrefs = [h for h in hrefs if (not sub) or (f"/{sub}/" in h) or h.endswith("/"+sub)]
-        files, seen = [], set()
-        for h in hrefs:
-            rel = h.split("/blob/", 1)[-1].split("?", 1)[0]
-            rel = _normalize_rel_for_raw(rel, branch)
-            name = rel.split("/")[-1]
-            raw  = f"https://raw.githubusercontent.com/{owner}/{repo}/{branch}/{rel}"
-            if name.lower().endswith(".csv") and rel not in seen:
-                seen.add(rel)
-                files.append({"name": name, "download_url": raw, "path": rel})
-        return files, {"status": r.status_code, "where": "html_plain", "count": len(files)}
-    except Exception as e:
-        return [], {"status": "ERR", "where": "html_plain", "error": str(e)}
-
-def _list_with_html(owner: str, repo: str, path: str, branch: str):
-    url = f"https://github.com/{owner}/{repo}/tree/{branch}/{path}".rstrip("/")
-    try:
-        r = requests.get(url, timeout=30)
-        if r.status_code >= 400:
-            return [], {"status": r.status_code, "where": "html"}
-        hrefs = _extract_csv_links(r.text)
-        sub = path.strip("/")
-        hrefs = [h for h in hrefs if (not sub) or (f"/{sub}/" in h) or h.endswith("/"+sub)]
-        files, seen = [], set()
-        for h in hrefs:
-            rel = h.split("/blob/", 1)[-1].split("?", 1)[0]
-            rel = _normalize_rel_for_raw(rel, branch)
-            name = rel.split("/")[-1]
-            raw  = f"https://raw.githubusercontent.com/{owner}/{repo}/{branch}/{rel}"
-            if name.lower().endswith(".csv") and rel not in seen:
-                seen.add(rel)
-                files.append({"name": name, "download_url": raw, "path": rel})
-        return files, {"status": r.status_code, "where": "html", "count": len(files)}
-    except Exception as e:
-        return [], {"status": "ERR", "where": "html", "error": str(e)}
-
-def _list_with_contents_api(owner: str, repo: str, path: str, branch: str):
+def list_with_contents_api(owner: str, repo: str, path: str, branch: str):
     url = f"https://api.github.com/repos/{owner}/{repo}/contents/{path}?ref={branch}"
     try:
         r = requests.get(url, headers=_gh_headers(), timeout=30)
@@ -238,49 +283,18 @@ def _list_with_contents_api(owner: str, repo: str, path: str, branch: str):
         items = r.json()
         if isinstance(items, dict) and items.get("type") == "file":
             items = [items]
-        files = [
-            {"name": it["name"], "download_url": it.get("download_url"), "path": it.get("path")}
-            for it in items
-            if it.get("type") == "file" and str(it.get("name","")).lower().endswith(".csv")
-        ]
+        files = []
+        for it in items:
+            if it.get("type") != "file":
+                continue
+            name = str(it.get("name",""))
+            if name.lower().endswith(".csv") and FILENAME_REGEX.match(name):
+                files.append({"name": name, "download_url": it.get("download_url"), "path": it.get("path"), "source": "contents"})
         return files, {"status": r.status_code, "where": "contents_api", "count": len(files)}
     except Exception as e:
         return [], {"status": "ERR", "where": "contents_api", "error": str(e)}
 
-# ---------- Función cacheada de listado (30 minutos) ----------
-@st.cache_data(ttl=1800, show_spinner=False)
-def github_list_files(owner: str, repo: str, path: str, branch: str,
-                      prefer_html: bool, token_present: bool):
-    debug = []
-    files = []
-
-    def try_and_log(fn, *args):
-        f, meta = fn(*args)
-        debug.append(meta)
-        return f
-
-    if prefer_html or not token_present:
-        # Prioriza HTML (no consume API)
-        files = try_and_log(_list_with_html_plain, owner, repo, path, branch)
-        if not files:
-            files = try_and_log(_list_with_html, owner, repo, path, branch)
-        if not files and token_present:
-            files = try_and_log(_list_with_contents_api, owner, repo, path, branch)
-            if not files:
-                files = try_and_log(_list_with_git_tree, owner, repo, branch, path)
-    else:
-        # Con token, intenta API primero
-        files = try_and_log(_list_with_git_tree, owner, repo, branch, path)
-        if not files:
-            files = try_and_log(_list_with_contents_api, owner, repo, path, branch)
-        if not files:
-            files = try_and_log(_list_with_html_plain, owner, repo, path, branch)
-            if not files:
-                files = try_and_log(_list_with_html, owner, repo, path, branch)
-
-    return files, debug
-
-# ================ Conversión ICCA (definida ANTES de usarse) ================
+# ================ Conversión y figuras ================
 def convert_icca_ranges_ppm(ranges_ppm, target_unit, mw):
     tu = (target_unit or "").lower().replace("ug/m3","µg/m³").replace("ug/m³","µg/m³")
     out = []
@@ -324,13 +338,15 @@ def make_line_figure(x, y, title, color, y_title, icca_ranges=None, show_icca=Tr
         fig.update_layout(shapes=shapes + lines)
     return fig
 
-def make_pm_figure(df, pm_map, pm_band_choice, show_icca=True):
+def make_pm_figure(df, pm_labels, pm_band_choice, show_icca=True):
     fig = go.Figure()
-    for _, label, color in pm_map:
-        lw = 2.5 if label == "PM2.5" else 2
-        fig.add_trace(go.Scatter(x=df["dt"], y=df[label], name=label, mode="lines",
-                                 line=dict(color=color, width=lw)))
-    if show_icca:
+    color_map = {"PM1":"#8ECAE6","PM2.5":"#FB8500","PM10":"#219EBC"}
+    for label in pm_labels:
+        if label in df.columns:
+            lw = 2.5 if label == "PM2.5" else 2
+            fig.add_trace(go.Scatter(x=df["dt"], y=df[label], name=label, mode="lines",
+                                     line=dict(color=color_map[label], width=lw)))
+    if show_icca and not df.empty:
         x0, x1 = df["dt"].min(), df["dt"].max()
         icca_ranges = ICCA["PM2.5"] if pm_band_choice == "PM2.5" else ICCA["PM10"]
         shapes, lines = make_bands(x0, x1, icca_ranges, opacity=0.12)
@@ -342,109 +358,105 @@ def make_pm_figure(df, pm_map, pm_band_choice, show_icca=True):
     return fig
 
 # =============================== UI / APP ===============================
-st.set_page_config(page_title="Visor mensual de calidad de aire (GitHub)", layout="wide")
+st.set_page_config(page_title="Visor mensual de calidad de aire (GitHub ZIP-first)", layout="wide")
 st.markdown("""<style>.block-container{max-width:1200px;margin:0 auto;}h1,h2,h3{text-align:center;}</style>""",
             unsafe_allow_html=True)
 
-st.title("Visor mensual de calidad de aire — Fuente: GitHub")
-st.caption("Lista CSV desde la carpeta del repo y grafica 2×2 con bandas ICCA.")
+st.title("Visor mensual — ZIP primero (sin rate limits)")
+st.caption("Carga automática desde carpeta del repo o auto-descubre; 2×2 con bandas ICCA.")
 
 with st.sidebar:
     st.header("Fuente de datos (GitHub)")
     owner  = st.text_input("Owner", value=DEFAULT_GITHUB_OWNER)
     repo   = st.text_input("Repo",  value=DEFAULT_GITHUB_REPO)
-    path   = st.text_input("Ruta en el repo", value=DEFAULT_PATH_IN_REPO)
+    path   = st.text_input("Ruta en el repo", value=DEFAULT_PATH_IN_REPO)   # p.ej. datos o datosCA
     branch = st.text_input("Branch", value=DEFAULT_BRANCH)
 
-    st.caption("Pega URL de carpeta (acepta /tree/ o /blob/):")
-    gh_url = st.text_input("URL de carpeta", value="", placeholder="https://github.com/owner/repo/tree/branch/carpeta")
-    if gh_url.strip():
-        try:
-            url_fixed = _to_tree_url_if_blob(gh_url.strip())
-            parts = url_fixed.split("github.com/")[-1].split("/")
-            owner = parts[0]; repo = parts[1]
-            idx_tree = parts.index("tree") if "tree" in parts else -1
-            if idx_tree != -1 and len(parts) > idx_tree+1:
-                branch = parts[idx_tree+1]
-                path = "/".join(parts[idx_tree+2:]) if len(parts) > idx_tree+2 else ""
-        except Exception:
-            st.warning("No pude interpretar la URL; usando owner/repo/ruta/branch.")
-
-    st.divider()
-    token_present = bool(_gh_headers())
-    prefer_html = st.checkbox("Forzar solo HTML (sin API)", value=(not token_present),
-                              help="Útil si no tienes GITHUB_TOKEN o ves rate limits.")
-    direct_csv_url = st.text_input("Plan B: URL directa a un CSV (raw o blob)", value="",
-                                   placeholder="https://github.com/.../blob/main/datosCA/device_...csv")
+    prefer_zip = st.checkbox("Preferir ZIP (recomendado)", value=True,
+                             help="Usa codeload.github.com (no depende de API ni HTML).")
+    allow_html = st.checkbox("Permitir HTML como fallback", value=True)
+    allow_api  = st.checkbox("Permitir API como último recurso", value=False,
+                             help="Sin GITHUB_TOKEN te puedes topar rate limit.")
 
     st.divider()
     show_icca = st.checkbox("Mostrar bandas ICCA", value=True)
     pm_band_choice = st.radio("Umbral fondo particulados", ["PM2.5","PM10"], index=0)
-
     if st.button("Recargar / limpiar caché"):
         st.cache_data.clear()
         st.success("Caché limpiada.")
 
-# --- Listar CSV usando la función CACHEADA y el modo elegido ---
-files, debug = github_list_files(owner, repo, path, branch, prefer_html, token_present)
+# =============== LISTADO ROBUSTO ===============
+debug = []
+files: List[dict] = []
+
+zip_bytes = None
+if prefer_zip:
+    try:
+        zip_bytes = download_repo_zip(owner, repo, branch)
+        files = list_csvs_from_zip(zip_bytes, path, branch)
+        debug.append({"where":"zip_list", "count":len(files)})
+        if not files:
+            # auto-descubrir en TODO el repo
+            files = autodiscover_device_csvs_zip(zip_bytes, branch)
+            debug.append({"where":"zip_autodiscover", "count":len(files)})
+    except Exception as e:
+        debug.append({"where":"zip_error", "error":str(e)})
+
+if not files and allow_html:
+    # HTML plain
+    f1, m1 = list_with_html(owner, repo, path, branch, plain=True);  debug.append(m1)
+    if not f1:
+        f2, m2 = list_with_html(owner, repo, path, branch, plain=False); debug.append(m2)
+        files = f2
+    else:
+        files = f1
+
+if not files and allow_api:
+    f3, m3 = list_with_git_tree(owner, repo, branch, path);          debug.append(m3)
+    if not f3:
+        f4, m4 = list_with_contents_api(owner, repo, path, branch);  debug.append(m4)
+        files = f4
+    else:
+        files = f3
 
 with st.expander("Diagnóstico de listado"):
     st.write({"owner": owner, "repo": repo, "path": path, "branch": branch,
-              "prefer_html": prefer_html, "token_present": token_present})
+              "prefer_zip": prefer_zip, "allow_html": allow_html, "allow_api": allow_api})
     st.write(debug)
 
 if not files:
-    if direct_csv_url.strip():
-        raw = _raw_from_blob_or_raw(owner, repo, branch, direct_csv_url.strip())
-        files = [{"name": raw.split("/")[-1].split("?")[0], "download_url": raw, "path": raw}]
-    else:
-        st.error("No encontré CSV. Verifica branch/carpeta o pega una URL directa en 'Plan B'.")
-        st.stop()
+    st.error("No encontré CSV con el patrón device_*_1hr.csv en la ruta ni en el repo.")
+    st.stop()
 
-# Construir índice e intentar parsear año/mes del nombre
+# Índice por archivo
 rows = []
 for f in files:
     fname = f.get("name") or ""
-    if not fname: continue
+    if not fname or not FILENAME_REGEX.match(fname):
+        continue
     meta = parse_from_filename(fname)
     sid = meta["sid"]; station = STATION_MAP.get(sid, sid if sid else "Desconocida")
-    url = f.get("download_url") or f"https://raw.githubusercontent.com/{owner}/{repo}/{branch}/{f.get('path','')}"
-    rows.append({"name": fname, "url": url, "sid": sid, "station": station,
-                 "dt_start": meta["dt_start"], "dt_end": meta["dt_end"],
-                 "year": meta["year"], "month": meta["month"]})
+    rows.append({
+        "name": fname,
+        "url": f.get("download_url"),
+        "path": f.get("path"),
+        "sid": sid,
+        "station": station,
+        "dt_start": meta["dt_start"],
+        "dt_end": meta["dt_end"],
+        "year": meta["year"],
+        "month": meta["month"],
+        "source": f.get("source")
+    })
 files_df = pd.DataFrame(rows)
 if files_df.empty:
-    st.error("No se pudo construir el índice de archivos."); st.stop()
-
-# Si falta año/mes, inferir desde el CSV
-if files_df["year"].isna().any() or files_df["month"].isna().any():
-    need_rows = files_df[files_df["year"].isna() | files_df["month"].isna()]
-    for i, r in need_rows.iterrows():
-        try:
-            tmp = fetch_csv(r["url"])
-            col_utc  = find_column(tmp, COL_CANDIDATES["UTC"])
-            col_date = find_column(tmp, COL_CANDIDATES["DATE"])
-            col_time = find_column(tmp, COL_CANDIDATES["TIME"])
-            if col_utc is not None:
-                dt = pd.to_datetime(tmp[col_utc], errors="coerce", utc=True).dt.tz_convert(None)
-            elif (col_date is not None) and (col_time is not None):
-                dt = pd.to_datetime(tmp[col_date].astype(str)+" "+tmp[col_time].astype(str),
-                                    errors="coerce", dayfirst=True)
-            else:
-                dt = pd.Series([], dtype="datetime64[ns]")
-            dt = pd.Series(dt).dropna()
-            if not dt.empty:
-                files_df.at[i, "dt_start"] = dt.min()
-                files_df.at[i, "dt_end"]   = dt.max()
-                files_df.at[i, "year"]     = int(dt.min().year)
-                files_df.at[i, "month"]    = int(dt.min().month)
-        except Exception:
-            pass
+    st.error("No se pudo construir índice; revisa nombres de archivo.")
+    st.stop()
 
 # Controles (Año/Mes/Estación)
 valid_years = sorted([int(y) for y in files_df["year"].dropna().unique()], reverse=True)
 if not valid_years:
-    st.error("No pude resolver año/mes. Revisa patrón de nombre o usa 'Plan B' con un CSV puntual."); st.stop()
+    st.error("No pude resolver año/mes desde los nombres."); st.stop()
 
 year_sel = st.selectbox("Año", valid_years)
 month_names = {1:"Enero",2:"Febrero",3:"Marzo",4:"Abril",5:"Mayo",6:"Junio",
@@ -457,19 +469,40 @@ if subset.empty:
     st.warning("No hay archivos para ese año/mes."); st.stop()
 
 subset = subset.copy()
-subset["label"] = subset.apply(lambda r: f"{(r['station'] or 'Desconocida')} ({r['sid']})" if pd.notna(r["sid"]) else r["name"], axis=1)
+subset["label"] = subset.apply(lambda r: f"{(r['station'] or 'Desconocida')} ({r['sid']})", axis=1)
 station_label = st.selectbox("Estación", list(subset["label"]))
 row = subset[subset["label"] == station_label].iloc[0]
 
-st.caption(f"Archivo: `{row['name']}` · Estación: **{row['station']}** · Periodo: {row['dt_start']} → {row['dt_end']}")
+st.caption(f"Archivo: `{row['name']}` · Estación: **{row['station']}** · Periodo: {row['dt_start']} → {row['dt_end']} · Fuente: {row['source']}")
 
-# Cargar CSV elegido
+# =============== CARGA DEL CSV (desde ZIP si lo tenemos; si no, HTTP raw) ===============
+def read_selected_csv(row, zip_bytes: Optional[bytes]) -> pd.DataFrame:
+    if zip_bytes and row.get("path"):
+        # leer directo del zip (más robusto y sin llamadas web)
+        zf = zipfile.ZipFile(io.BytesIO(zip_bytes))
+        # Buscar entrada exacta dentro del zip: <repo>-<branch>/<row['path']>
+        # Averiguar prefijo root del zip:
+        root_prefix = None
+        for name in zf.namelist():
+            if name.endswith("/") and name.count("/") == 1:
+                root_prefix = name
+                break
+        if root_prefix:
+            inzip = root_prefix + row["path"]
+            if inzip in zf.namelist():
+                with zf.open(inzip) as fh:
+                    content = fh.read()
+                return fetch_csv_from_bytes(content)
+    # fallback: HTTP
+    return fetch_csv_http(row["url"])
+
 try:
-    df_raw = fetch_csv(row["url"])
+    df_raw = read_selected_csv(row, zip_bytes)
 except Exception as e:
-    st.error(f"No pude descargar/leer el CSV: {row['url']}\nDetalle: {e}"); st.stop()
+    st.error(f"No pude leer el CSV seleccionado.\nDetalle: {e}")
+    st.stop()
 
-# Resolver fecha/hora
+# =============== PARSEO DE TIEMPO Y MAPEO DE COLUMNAS ===============
 col_utc  = find_column(df_raw, COL_CANDIDATES["UTC"])
 col_date = find_column(df_raw, COL_CANDIDATES["DATE"])
 col_time = find_column(df_raw, COL_CANDIDATES["TIME"])
@@ -481,7 +514,6 @@ elif (col_date is not None) and (col_time is not None):
 else:
     st.error("No encontré columnas de tiempo (UTC o Date+Time)."); st.stop()
 
-# Mapear columnas
 mapped = {k: find_column(df_raw, COL_CANDIDATES[k]) for k in ["PM1","PM25","PM10","NO2","SO2","O3","CO"]}
 unit_cols = {
     "NO2": find_column(df_raw, COL_CANDIDATES["NO2_UNIT"]),
@@ -493,85 +525,85 @@ unit_cols = {
     "PM10":find_column(df_raw, COL_CANDIDATES["PM10_UNIT"]),
 }
 no2_col, so2_col, o3_col = mapped.get("NO2"), mapped.get("SO2"), mapped.get("O3")
-gases_missing = [name for name, col in {"NO₂":no2_col,"SO₂":so2_col,"O₃":o3_col}.items() if col is None]
-if gases_missing:
-    st.error("El CSV no contiene: " + ", ".join(gases_missing)); st.stop()
 
-pm_map=[]
-if mapped.get("PM1"):  pm_map.append((mapped["PM1"],  "PM1",   "#8ECAE6"))
-if mapped.get("PM25"): pm_map.append((mapped["PM25"], "PM2.5", "#FB8500"))
-if mapped.get("PM10"): pm_map.append((mapped["PM10"], "PM10",  "#219EBC"))
-if len(pm_map)==0:
-    st.error("No se encontraron columnas de particulado (PM1/PM2.5/PM10) en el CSV."); st.stop()
-
-# Unidades
-def unit_from_column2(df, unit_col, default):
+def unit_from_column(df, unit_col, default):
     if unit_col and unit_col in df.columns:
         v = df[unit_col].dropna().astype(str)
         if len(v): return v.iloc[0].strip()
     return default
 
-no2_unit = unit_from_column2(df_raw, unit_cols.get("NO2"), "µg/m³")
-o3_unit  = unit_from_column2(df_raw, unit_cols.get("O3"),  "µg/m³")
-so2_unit = unit_from_column2(df_raw, unit_cols.get("SO2"), "µg/m³")
-co_unit  = unit_from_column2(df_raw, unit_cols.get("CO"),  "mg/m³")
+no2_unit = unit_from_column(df_raw, unit_cols.get("NO2"), "µg/m³")
+o3_unit  = unit_from_column(df_raw, unit_cols.get("O3"),  "µg/m³")
+so2_unit = unit_from_column(df_raw, unit_cols.get("SO2"), "µg/m³")
 
-# DataFrame final
-data = {"dt": dt,
-        "NO₂": pd.to_numeric(df_raw[no2_col], errors="coerce"),
-        "SO₂": pd.to_numeric(df_raw[so2_col], errors="coerce"),
-        "O₃":  pd.to_numeric(df_raw[o3_col],  errors="coerce")}
-for col, label, _ in pm_map:
-    data[label] = pd.to_numeric(df_raw[col], errors="coerce")
+def to_numeric(series): return pd.to_numeric(series, errors="coerce")
+
+data = {"dt": dt}
+pm_labels = []
+if mapped.get("PM1"):  data["PM1"]  = to_numeric(df_raw[mapped["PM1"]]);  pm_labels.append("PM1")
+if mapped.get("PM25"): data["PM2.5"]= to_numeric(df_raw[mapped["PM25"]]); pm_labels.append("PM2.5")
+if mapped.get("PM10"): data["PM10"] = to_numeric(df_raw[mapped["PM10"]]); pm_labels.append("PM10")
+
+# Gases: si faltan en el archivo, se muestra solo PM (no crashea)
+if no2_col is not None: data["NO₂"] = to_numeric(df_raw[no2_col])
+if so2_col is not None: data["SO₂"] = to_numeric(df_raw[so2_col])
+if o3_col  is not None: data["O₃"]  = to_numeric(df_raw[o3_col])
+
 df = pd.DataFrame(data).sort_values("dt").reset_index(drop=True)
 
-# ---- Gráficas ----
+# =============== GRÁFICAS ===============
 sp_left, center_col, sp_right = st.columns([0.1,0.8,0.1])
 with center_col:
     c1, c2 = st.columns(2, gap="large")
     with c1:
-        st.plotly_chart(make_pm_figure(df, pm_map, pm_band_choice, show_icca), use_container_width=True)
+        st.plotly_chart(make_pm_figure(df, pm_labels, pm_band_choice, show_icca), use_container_width=True)
     with c2:
-        no2_icca = convert_icca_ranges_ppm(ICCA["NO2_ppm"], no2_unit, MW["NO2"])
-        st.plotly_chart(
-            make_line_figure(df["dt"], df["NO₂"], f"NO₂ ({no2_unit})",
-                             "#2A9D8F", f"Concentración ({no2_unit})",
-                             icca_ranges=no2_icca, show_icca=show_icca),
-            use_container_width=True
-        )
+        if "NO₂" in df.columns:
+            no2_icca = convert_icca_ranges_ppm(ICCA["NO2_ppm"], no2_unit, MW["NO2"])
+            st.plotly_chart(
+                make_line_figure(df["dt"], df["NO₂"], f"NO₂ ({no2_unit})",
+                                 "#2A9D8F", f"Concentración ({no2_unit})",
+                                 icca_ranges=no2_icca, show_icca=show_icca),
+                use_container_width=True
+            )
+        else:
+            st.info("El CSV no tiene NO₂; se omite el gráfico.")
     c3, c4 = st.columns(2, gap="large")
     with c3:
-        so2_icca = convert_icca_ranges_ppm(ICCA["SO2_ppm"], so2_unit, MW["SO2"])
-        st.plotly_chart(
-            make_line_figure(df["dt"], df["SO₂"], f"SO₂ ({so2_unit})",
-                             "#E76F51", f"Concentración ({so2_unit})",
-                             icca_ranges=so2_icca, show_icca=show_icca),
-            use_container_width=True
-        )
+        if "SO₂" in df.columns:
+            so2_icca = convert_icca_ranges_ppm(ICCA["SO2_ppm"], so2_unit, MW["SO2"])
+            st.plotly_chart(
+                make_line_figure(df["dt"], df["SO₂"], f"SO₂ ({so2_unit})",
+                                 "#E76F51", f"Concentración ({so2_unit})",
+                                 icca_ranges=so2_icca, show_icca=show_icca),
+                use_container_width=True
+            )
+        else:
+            st.info("El CSV no tiene SO₂; se omite el gráfico.")
     with c4:
-        o3_icca = convert_icca_ranges_ppm(ICCA["O3_ppm"], o3_unit, MW["O3"])
-        st.plotly_chart(
-            make_line_figure(df["dt"], df["O₃"], f"O₃ ({o3_unit})",
-                             "#264653", f"Concentración ({o3_unit})",
-                             icca_ranges=o3_icca, show_icca=show_icca),
-            use_container_width=True
-        )
+        if "O₃" in df.columns:
+            o3_icca = convert_icca_ranges_ppm(ICCA["O3_ppm"], o3_unit, MW["O3"])
+            st.plotly_chart(
+                make_line_figure(df["dt"], df["O₃"], f"O₃ ({o3_unit})",
+                                 "#264653", f"Concentración ({o3_unit})",
+                                 icca_ranges=o3_icca, show_icca=show_icca),
+                use_container_width=True
+            )
+        else:
+            st.info("El CSV no tiene O₃; se omite el gráfico.")
 
-# Estadísticas
+# =============== Estadísticas y descarga ===============
 with st.expander("Estadísticas del mes (valores originales)"):
-    cols_for_stats = [lab for _, lab, _ in pm_map] + ["NO₂","SO₂","O₃"]
+    cols_for_stats = [c for c in ["PM1","PM2.5","PM10","NO₂","SO₂","O₃"] if c in df.columns]
     st.dataframe(
         df[cols_for_stats].describe().T.rename(
             columns={"mean":"media","std":"desv.std","min":"mín","max":"máx"}
         )[["count","media","desv.std","mín","25%","50%","75%","máx"]]
     )
 
-# Descarga del CSV limpio
-safe_year  = int(subset.iloc[0]['year'])  if pd.notna(subset.iloc[0]['year'])  else None
-safe_month = int(subset.iloc[0]['month']) if pd.notna(subset.iloc[0]['month']) else None
-year_str   = f"{safe_year}"      if safe_year  is not None else "YYYY"
-month_str  = f"{safe_month:02d}" if safe_month is not None else "MM"
-sid_str    = row.get('sid') or 'NA'
-file_stub  = f"clean_{sid_str}_{year_str}{month_str}"
+year_str  = f"{int(row['year'])}"  if pd.notna(row['year'])  else "YYYY"
+month_str = f"{int(row['month']):02d}" if pd.notna(row['month']) else "MM"
+sid_str   = row.get('sid') or 'NA'
+file_stub = f"clean_{sid_str}_{year_str}{month_str}"
 st.download_button("Descargar CSV limpio (este archivo)", data=df.to_csv(index=False),
                    file_name=f"{file_stub}.csv", mime="text/csv")
