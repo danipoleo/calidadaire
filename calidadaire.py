@@ -1,7 +1,6 @@
 # app.py
 # Visor mensual 2x2 con bandas ICCA (PM1/PM2.5/PM10, NO2, SO2, O3)
-# Fuente: carpeta de GitHub (Contents API / raw URLs)
-# Requisitos: streamlit, pandas, plotly, requests, python-dateutil (implícito)
+# Fuente: carpeta de GitHub (Trees API -> HTML plain -> HTML normal -> Contents API)
 
 import io
 import os
@@ -18,7 +17,7 @@ import plotly.graph_objects as go
 # =================== CONFIG POR DEFECTO ===================
 DEFAULT_GITHUB_OWNER = "danipoleo"
 DEFAULT_GITHUB_REPO  = "calidadaire"
-DEFAULT_PATH_IN_REPO = "datos"
+DEFAULT_PATH_IN_REPO = "datosCA"
 DEFAULT_BRANCH       = "main"
 # ==========================================================
 
@@ -61,11 +60,6 @@ FILENAME_REGEX = re.compile(
 )
 
 def parse_from_filename(name: str):
-    """
-    Extrae sid, dt_start, dt_end, year, month desde:
-    'device_<sid>_<YYYYMMDDHHMM>_<YYYYMMDDHHMM>_1hr.csv'.
-    Si no coincide, devuelve claves con None.
-    """
     m = FILENAME_REGEX.match(name or "")
     if not m:
         return {"sid": None, "dt_start": None, "dt_end": None, "year": None, "month": None}
@@ -75,78 +69,32 @@ def parse_from_filename(name: str):
     try:
         dt_start = datetime.strptime(start, "%Y%m%d%H%M")
         dt_end   = datetime.strptime(end,   "%Y%m%d%H%M")
-        return {
-            "sid": sid,
-            "dt_start": dt_start,
-            "dt_end": dt_end,
-            "year": dt_start.year,
-            "month": dt_start.month
-        }
+        return {"sid": sid, "dt_start": dt_start, "dt_end": dt_end, "year": dt_start.year, "month": dt_start.month}
     except Exception:
         return {"sid": sid, "dt_start": None, "dt_end": None, "year": None, "month": None}
-# =============================================================
 
 # ---------- ICCA (rangos base) ----------
 ICCA: Dict[str, List[Tuple[str, str, float, float]]] = {
-    "PM10": [
-        ("Verde",      "#00A65A", 0,    60),
-        ("Amarillo",   "#FFC107", 61,   100),
-        ("Anaranjado", "#FF9800", 101,  200),
-        ("Rojo",       "#E53935", 201,  250),
-        ("Púrpura",    "#8E24AA", 250,  math.inf),
-    ],
-    "PM2.5": [
-        ("Verde",      "#00A65A", 0,    15),
-        ("Amarillo",   "#FFC107", 15.1, 40),
-        ("Anaranjado", "#FF9800", 40.1, 65),
-        ("Rojo",       "#E53935", 66,   100),
-        ("Púrpura",    "#8E24AA", 100,  math.inf),
-    ],
-    "NO2_ppm": [
-        ("Verde",      "#00A65A", 0,     0.105),
-        ("Amarillo",   "#FFC107", 0.106, 0.210),
-        ("Anaranjado", "#FF9800", 0.211, 0.315),
-        ("Rojo",       "#E53935", 0.316, 0.420),
-        ("Púrpura",    "#8E24AA", 0.420, math.inf),
-    ],
-    "O3_ppm": [
-        ("Verde",      "#00A65A", 0,     0.055),
-        ("Amarillo",   "#FFC107", 0.056, 0.110),
-        ("Anaranjado", "#FF9800", 0.111, 0.165),
-        ("Rojo",       "#E53935", 0.166, 0.220),
-        ("Púrpura",    "#8E24AA", 0.220, math.inf),
-    ],
-    "SO2_ppm": [
-        ("Verde",      "#00A65A", 0,     0.065),
-        ("Amarillo",   "#FFC107", 0.066, 0.130),
-        ("Anaranjado", "#FF9800", 0.131, 0.195),
-        ("Rojo",       "#E53935", 0.196, 0.260),
-        ("Púrpura",    "#8E24AA", 0.260, math.inf),
-    ],
-    "CO_ppm": [
-        ("Verde",      "#00A65A", 0,     5.50),
-        ("Amarillo",   "#FFC107", 5.51,  11.0),
-        ("Anaranjado", "#FF9800", 11.01, 16.5),
-        ("Rojo",       "#E53935", 16.51, 22.0),
-        ("Púrpura",    "#8E24AA", 22.0,  math.inf),
-    ],
+    "PM10": [("Verde","#00A65A",0,60),("Amarillo","#FFC107",61,100),("Anaranjado","#FF9800",101,200),("Rojo","#E53935",201,250),("Púrpura","#8E24AA",250,math.inf)],
+    "PM2.5":[("Verde","#00A65A",0,15),("Amarillo","#FFC107",15.1,40),("Anaranjado","#FF9800",40.1,65),("Rojo","#E53935",66,100),("Púrpura","#8E24AA",100,math.inf)],
+    "NO2_ppm":[("Verde","#00A65A",0,0.105),("Amarillo","#FFC107",0.106,0.210),("Anaranjado","#FF9800",0.211,0.315),("Rojo","#E53935",0.316,0.420),("Púrpura","#8E24AA",0.420,math.inf)],
+    "O3_ppm":[("Verde","#00A65A",0,0.055),("Amarillo","#FFC107",0.056,0.110),("Anaranjado","#FF9800",0.111,0.165),("Rojo","#E53935",0.166,0.220),("Púrpura","#8E24AA",0.220,math.inf)],
+    "SO2_ppm":[("Verde","#00A65A",0,0.065),("Amarillo","#FFC107",0.066,0.130),("Anaranjado","#FF9800",0.131,0.195),("Rojo","#E53935",0.196,0.260),("Púrpura","#8E24AA",0.260,math.inf)],
+    "CO_ppm":[("Verde","#00A65A",0,5.50),("Amarillo","#FFC107",5.51,11.0),("Anaranjado","#FF9800",11.01,16.5),("Rojo","#E53935",16.51,22.0),("Púrpura","#8E24AA",22.0,math.inf)],
 }
 MW = {"NO2": 46.01, "O3": 48.00, "SO2": 64.07, "CO": 28.01}
 
 # ========================== Utilidades ==========================
 
 def _gh_headers() -> Dict[str, str]:
-    """Headers opcionales con token para evitar rate-limits en GitHub (Streamlit Secrets o env)."""
-    token = st.secrets.get("GITHUB_TOKEN", None) or os.environ.get("GITHUB_TOKEN", None)
+    token = st.secrets.get("GITHUB_TOKEN") or os.environ.get("GITHUB_TOKEN")
     return {"Authorization": f"Bearer {token}"} if token else {}
 
 def find_column(df: pd.DataFrame, options: List[str]) -> Optional[str]:
-    # Coincidencia exacta
     for candidate in options:
         for col in df.columns:
             if col.strip().lower() == candidate.strip().lower():
                 return col
-    # Coincidencia parcial
     lower_cols = {c.lower(): c for c in df.columns}
     for candidate in options:
         c = candidate.strip().lower()
@@ -156,15 +104,9 @@ def find_column(df: pd.DataFrame, options: List[str]) -> Optional[str]:
     return None
 
 def _clean_earthsense_text(txt: str) -> str:
-    """
-    Devuelve SOLO la parte útil del CSV: desde la fila de encabezados reales
-    ('Date (Local)', 'UTC Time Stamp', ...) hacia abajo.
-    También descarta líneas sueltas/rotas que no tengan suficientes comas.
-    """
     txt = txt.replace("\r\n", "\n").replace("\r", "\n")
     if txt.startswith("\ufeff"):
         txt = txt.lstrip("\ufeff")
-
     lines = txt.split("\n")
     header_idx = None
     for i, line in enumerate(lines):
@@ -172,74 +114,131 @@ def _clean_earthsense_text(txt: str) -> str:
         if "date (local)" in l and "utc time stamp" in l:
             header_idx = i
             break
-
     if header_idx is None:
-        return txt  # no encontré cabecera — leer tal cual
-
+        return txt
     useful = lines[header_idx:]
     filtered = [ln for ln in useful if ln.count(",") >= 5 or ln.strip().lower().startswith("date (local)")]
     return "\n".join(filtered)
 
 @st.cache_data(ttl=300, show_spinner=False)
 def fetch_csv(url: str) -> pd.DataFrame:
-    """
-    Descarga y lee un CSV tipo EarthSense con metadatos arriba.
-    Usa engine='python' y on_bad_lines='skip' para tolerar líneas raras.
-    """
     r = requests.get(url, headers=_gh_headers(), timeout=60)
     r.raise_for_status()
-    # decodificar como texto
     try:
         txt = r.content.decode("utf-8")
     except UnicodeDecodeError:
         txt = r.content.decode("latin-1", errors="replace")
-
     clean_txt = _clean_earthsense_text(txt)
-
-    # Intento principal: separador ','
     try:
-        return pd.read_csv(
-            io.StringIO(clean_txt),
-            engine="python",
-            sep=",",
-            quotechar='"',
-            on_bad_lines="skip",
-            na_values=["N/A", "NA", "", "null", "None"],
-        )
+        return pd.read_csv(io.StringIO(clean_txt), engine="python", sep=",", quotechar='"',
+                           on_bad_lines="skip", na_values=["N/A","NA","","null","None"])
     except Exception:
-        # Alterno: separador ';'
-        return pd.read_csv(
-            io.StringIO(clean_txt),
-            engine="python",
-            sep=";",
-            quotechar='"',
-            on_bad_lines="skip",
-            na_values=["N/A", "NA", "", "null", "None"],
-        )
+        return pd.read_csv(io.StringIO(clean_txt), engine="python", sep=";", quotechar='"',
+                           on_bad_lines="skip", na_values=["N/A","NA","","null","None"])
+
+# ------------- LISTADO DE ARCHIVOS EN GITHUB (robusto) -------------
+def _list_with_git_tree(owner: str, repo: str, branch: str, subpath: str):
+    url = f"https://api.github.com/repos/{owner}/{repo}/git/trees/{branch}?recursive=1"
+    try:
+        r = requests.get(url, headers=_gh_headers(), timeout=30)
+        if r.status_code == 403:
+            return [], {"status": 403, "where": "git_tree"}
+        r.raise_for_status()
+        data = r.json()
+        tree = data.get("tree", [])
+        sub = subpath.strip("/")
+        out = []
+        for node in tree:
+            p = node.get("path", "")
+            if node.get("type") == "blob" and p.lower().endswith(".csv"):
+                if not sub or p.startswith(sub + "/") or p == sub:
+                    name = p.split("/")[-1]
+                    out.append({"name": name,
+                                "download_url": f"https://raw.githubusercontent.com/{owner}/{repo}/{branch}/{p}",
+                                "path": p})
+        return out, {"status": r.status_code, "where": "git_tree", "count": len(out)}
+    except Exception as e:
+        return [], {"status": "ERR", "where": "git_tree", "error": str(e)}
+
+def _extract_csv_links(html: str) -> List[str]:
+    return re.findall(r'href="([^"]+?/blob/[^"]+?\.csv[^"]*)"', html, flags=re.IGNORECASE)
+
+def _list_with_html_plain(owner: str, repo: str, path: str, branch: str):
+    url = f"https://github.com/{owner}/{repo}/tree/{branch}/{path}".rstrip("/") + "?plain=1"
+    try:
+        r = requests.get(url, timeout=30)
+        if r.status_code >= 400:
+            return [], {"status": r.status_code, "where": "html_plain"}
+        hrefs = _extract_csv_links(r.text)
+        sub = path.strip("/")
+        hrefs = [h for h in hrefs if (not sub) or (f"/{sub}/" in h) or h.endswith("/"+sub)]
+        files, seen = [], set()
+        for h in hrefs:
+            rel = h.split("/blob/",1)[-1].split("?",1)[0]
+            name = rel.split("/")[-1]
+            raw  = f"https://raw.githubusercontent.com/{owner}/{repo}/{branch}/{rel}"
+            if name.lower().endswith(".csv") and rel not in seen:
+                seen.add(rel)
+                files.append({"name": name, "download_url": raw, "path": rel})
+        return files, {"status": r.status_code, "where": "html_plain", "count": len(files)}
+    except Exception as e:
+        return [], {"status": "ERR", "where": "html_plain", "error": str(e)}
+
+def _list_with_html(owner: str, repo: str, path: str, branch: str):
+    url = f"https://github.com/{owner}/{repo}/tree/{branch}/{path}".rstrip("/")
+    try:
+        r = requests.get(url, timeout=30)
+        if r.status_code >= 400:
+            return [], {"status": r.status_code, "where": "html"}
+        hrefs = _extract_csv_links(r.text)
+        sub = path.strip("/")
+        hrefs = [h for h in hrefs if (not sub) or (f"/{sub}/" in h) or h.endswith("/"+sub)]
+        files, seen = [], set()
+        for h in hrefs:
+            rel = h.split("/blob/",1)[-1].split("?",1)[0]
+            name = rel.split("/")[-1]
+            raw  = f"https://raw.githubusercontent.com/{owner}/{repo}/{branch}/{rel}"
+            if name.lower().endswith(".csv") and rel not in seen:
+                seen.add(rel)
+                files.append({"name": name, "download_url": raw, "path": rel})
+        return files, {"status": r.status_code, "where": "html", "count": len(files)}
+    except Exception as e:
+        return [], {"status": "ERR", "where": "html", "error": str(e)}
+
+def _list_with_contents_api(owner: str, repo: str, path: str, branch: str):
+    url = f"https://api.github.com/repos/{owner}/{repo}/contents/{path}?ref={branch}"
+    try:
+        r = requests.get(url, headers=_gh_headers(), timeout=30)
+        if r.status_code == 403:
+            return [], {"status": 403, "where": "contents_api"}
+        r.raise_for_status()
+        items = r.json()
+        if isinstance(items, dict) and items.get("type") == "file":
+            items = [items]
+        files = [
+            {"name": it["name"], "download_url": it.get("download_url"), "path": it.get("path")}
+            for it in items
+            if it.get("type") == "file" and str(it.get("name","")).lower().endswith(".csv")
+        ]
+        return files, {"status": r.status_code, "where": "contents_api", "count": len(files)}
+    except Exception as e:
+        return [], {"status": "ERR", "where": "contents_api", "error": str(e)}
 
 @st.cache_data(ttl=300, show_spinner=False)
 def github_list_files(owner: str, repo: str, path: str, branch: str):
-    """Lista archivos (GitHub contents API) en una carpeta."""
-    url = f"https://api.github.com/repos/{owner}/{repo}/contents/{path}?ref={branch}"
-    r = requests.get(url, headers=_gh_headers(), timeout=30)
-    if r.status_code == 403:
-        st.warning("Límite de API de GitHub alcanzado. Agrega un GITHUB_TOKEN en Secrets si es posible.")
-    r.raise_for_status()
-    items = r.json()
-    if isinstance(items, dict) and items.get("type") == "file":
-        items = [items]
-    files = []
-    for it in items:
-        if it.get("type") == "file" and it.get("name", "").lower().endswith(".csv"):
-            files.append({
-                "name": it["name"],
-                "download_url": it.get("download_url"),
-                "path": it.get("path"),
-            })
-    return files
-
-def raw_url(owner: str, repo: str, path: str, branch: str) -> str:
-    return f"https://raw.githubusercontent.com/{owner}/{repo}/{branch}/{path}"
+    debug = []
+    files, meta = _list_with_git_tree(owner, repo, branch, path)
+    debug.append(meta)
+    if files: return files, debug
+    files, meta = _list_with_html_plain(owner, repo, path, branch)
+    debug.append(meta)
+    if files: return files, debug
+    files, meta = _list_with_html(owner, repo, path, branch)
+    debug.append(meta)
+    if files: return files, debug
+    files, meta = _list_with_contents_api(owner, repo, path, branch)
+    debug.append(meta)
+    return files, debug
 
 def unit_from_column(df: pd.DataFrame, unit_col: Optional[str], default: str) -> str:
     if unit_col and unit_col in df.columns:
@@ -269,7 +268,7 @@ def convert_icca_ranges_ppm(ranges_ppm, target_unit, mw):
 
 def make_bands(x0, x1, ranges, opacity=0.12):
     shapes, lines = [], []
-    for label, color, lo, hi in ranges:
+    for _, color, lo, hi in ranges:
         y0 = -math.inf if lo is None else lo
         y1 =  math.inf if (hi is None or math.isinf(hi)) else hi
         shapes.append(dict(type="rect", xref="x", yref="y",
@@ -307,13 +306,11 @@ def make_pm_figure(df, pm_map, pm_band_choice, show_icca=True):
         icca_ranges = ICCA["PM2.5"] if pm_band_choice == "PM2.5" else ICCA["PM10"]
         shapes, lines = make_bands(x0, x1, icca_ranges, opacity=0.12)
         fig.update_layout(shapes=shapes + lines)
-
     fig.update_layout(
         title=f"Particulados — PM1 / PM2.5 / PM10 (Bandas ICCA: {pm_band_choice})",
         template="plotly_white",
         margin=dict(l=20, r=20, t=60, b=30),
-        xaxis_title="Fecha/Hora",
-        yaxis_title="Concentración (µg/m³)",
+        xaxis_title="Fecha/Hora", yaxis_title="Concentración (µg/m³)",
         height=350,
         legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="center", x=0.5),
     )
@@ -338,12 +335,8 @@ with st.sidebar:
     path   = st.text_input("Ruta en el repo", value=DEFAULT_PATH_IN_REPO)
     branch = st.text_input("Branch", value=DEFAULT_BRANCH)
 
-    st.divider()
-    show_icca = st.checkbox("Mostrar bandas ICCA", value=True)
-    pm_band_choice = st.radio("Umbral para fondo de particulados", ["PM2.5","PM10"], index=0)
-
     st.caption("También puedes pegar la URL de carpeta (opcional):")
-    gh_url = st.text_input("URL de carpeta (opcional)", value="", placeholder="https://github.com/owner/repo/tree/branch/carpeta")
+    gh_url = st.text_input("URL de carpeta", value="", placeholder="https://github.com/owner/repo/tree/branch/carpeta")
     if gh_url.strip():
         try:
             parts = gh_url.strip().split("github.com/")[-1].split("/")
@@ -355,16 +348,43 @@ with st.sidebar:
         except Exception:
             st.warning("No pude interpretar la URL; usando los campos owner/repo/ruta/branch.")
 
-# --- Listar archivos CSV en la carpeta (robusto) ---
-try:
-    files = github_list_files(owner, repo, path, branch)
-except Exception as e:
-    st.error(f"No pude listar la carpeta en GitHub ({owner}/{repo}/{path}@{branch}). Detalle: {e}")
-    st.stop()
+    st.divider()
+    # Plan B: URL directa a un CSV si el listado falla
+    direct_csv_url = st.text_input("Plan B: URL directa a un CSV (raw o blob)", value="",
+                                   placeholder="https://github.com/.../blob/main/datos/device_...csv")
+
+    st.divider()
+    show_icca = st.checkbox("Mostrar bandas ICCA", value=True)
+    pm_band_choice = st.radio("Umbral para fondo de particulados", ["PM2.5","PM10"], index=0)
+
+    if st.button("Recargar / limpiar caché"):
+        st.cache_data.clear()
+        st.success("Caché limpiada.")
+
+# --- Listar CSV (con diagnóstico) ---
+files, debug = github_list_files(owner, repo, path, branch)
+
+with st.expander("Diagnóstico de listado"):
+    st.write("Parámetros:", {"owner": owner, "repo": repo, "path": path, "branch": branch})
+    st.write("Resultados por estrategia:", debug)
 
 if not files:
-    st.error("No encontré CSV en esa carpeta del repositorio. Verifica owner/repo/ruta/branch.")
-    st.stop()
+    if direct_csv_url.strip():
+        if "/blob/" in direct_csv_url and "raw.githubusercontent.com" not in direct_csv_url:
+            rel = direct_csv_url.split("/blob/",1)[-1].split("?",1)[0]
+            raw = f"https://raw.githubusercontent.com/{owner}/{repo}/{branch}/{rel}"
+        else:
+            raw = direct_csv_url
+        files = [{"name": raw.split("/")[-1].split("?")[0], "download_url": raw, "path": rel if 'rel' in locals() else raw}]
+    else:
+        st.error(
+            "No encontré CSV en esa carpeta.\n"
+            "Verifica:\n"
+            "• El *branch* es EXACTAMENTE 'main' (o ajusta el campo Branch).\n"
+            "• Los CSV están dentro de la subcarpeta indicada (p.ej. 'datos/').\n\n"
+            "También puedes pegar la **URL directa** a un CSV en 'Plan B'."
+        )
+        st.stop()
 
 # Construir índice e intentar parsear año/mes del nombre
 rows = []
@@ -375,9 +395,10 @@ for f in files:
     meta = parse_from_filename(fname)
     sid = meta["sid"]
     station = STATION_MAP.get(sid, sid if sid else "Desconocida")
+    url = f.get("download_url") or f"https://raw.githubusercontent.com/{owner}/{repo}/{branch}/{f.get('path','')}"
     rows.append({
         "name": fname,
-        "url": f.get("download_url") or raw_url(owner, repo, f.get("path",""), branch),
+        "url": url,
         "sid": sid,
         "station": station,
         "dt_start": meta["dt_start"],
@@ -402,7 +423,7 @@ if files_df["year"].isna().any() or files_df["month"].isna().any():
                 dt = pd.to_datetime(tmp[col_date].astype(str)+" "+tmp[col_time].astype(str),
                                     errors="coerce", dayfirst=True)
             else:
-                dt = pd.to_datetime(pd.NaT)
+                dt = pd.Series([], dtype="datetime64[ns]")
             dt = pd.Series(dt).dropna()
             if not dt.empty:
                 files_df.at[i, "dt_start"] = dt.min()
@@ -415,7 +436,7 @@ if files_df["year"].isna().any() or files_df["month"].isna().any():
 # Controles (Año/Mes/Estación)
 valid_years = sorted([int(y) for y in files_df["year"].dropna().unique()], reverse=True)
 if not valid_years:
-    st.error("No pude resolver año/mes de los archivos. Revisa el patrón del nombre o las columnas de tiempo.")
+    st.error("No pude resolver año/mes de los archivos. Verifica patrón de nombre o usa 'Plan B' con un CSV puntual.")
     st.stop()
 
 year_sel = st.selectbox("Año", valid_years)
@@ -429,15 +450,13 @@ if subset.empty:
     st.warning("No hay archivos para ese año/mes.")
     st.stop()
 
-# Selector de estación por etiqueta amigable
+# Selector de estación
 subset = subset.copy()
-subset["label"] = subset.apply(
-    lambda r: f"{(r['station'] or 'Desconocida')} ({r['sid']})" if pd.notna(r["sid"]) else r["name"], axis=1
-)
+subset["label"] = subset.apply(lambda r: f"{(r['station'] or 'Desconocida')} ({r['sid']})" if pd.notna(r["sid"]) else r["name"], axis=1)
 station_label = st.selectbox("Estación", list(subset["label"]))
 row = subset[subset["label"] == station_label].iloc[0]
 
-st.caption(f"Archivo: `{row['name']}`  ·  Estación: **{row['station']}**  ·  Periodo: {row['dt_start']} → {row['dt_end']}")
+st.caption(f"Archivo: `{row['name']}` · Estación: **{row['station']}** · Periodo: {row['dt_start']} → {row['dt_end']}")
 
 # Cargar CSV elegido
 try:
@@ -470,17 +489,13 @@ unit_cols = {
     "PM25":find_column(df_raw, COL_CANDIDATES["PM25_UNIT"]),
     "PM10":find_column(df_raw, COL_CANDIDATES["PM10_UNIT"]),
 }
-
-no2_col = mapped.get("NO2")
-so2_col = mapped.get("SO2")
-o3_col  = mapped.get("O3")
-
+no2_col, so2_col, o3_col = mapped.get("NO2"), mapped.get("SO2"), mapped.get("O3")
 gases_missing = [name for name, col in {"NO₂": no2_col, "SO₂": so2_col, "O₃": o3_col}.items() if col is None]
 if gases_missing:
     st.error("El CSV no contiene: " + ", ".join(gases_missing))
     st.stop()
 
-pm_map  = []
+pm_map = []
 if mapped.get("PM1"):  pm_map.append((mapped["PM1"],  "PM1",   "#8ECAE6"))
 if mapped.get("PM25"): pm_map.append((mapped["PM25"], "PM2.5", "#FB8500"))
 if mapped.get("PM10"): pm_map.append((mapped["PM10"], "PM10",  "#219EBC"))
@@ -488,7 +503,13 @@ if len(pm_map) == 0:
     st.error("No se encontraron columnas de particulado (PM1/PM2.5/PM10) en el CSV.")
     st.stop()
 
-# Detectar unidades (defaults razonables si no hay columnas de unidad)
+# Unidades
+def unit_from_column(df, unit_col, default):
+    if unit_col and unit_col in df.columns:
+        v = df[unit_col].dropna().astype(str)
+        if len(v): return v.iloc[0].strip()
+    return default
+
 no2_unit = unit_from_column(df_raw, unit_cols.get("NO2"), "µg/m³")
 o3_unit  = unit_from_column(df_raw, unit_cols.get("O3"),  "µg/m³")
 so2_unit = unit_from_column(df_raw, unit_cols.get("SO2"), "µg/m³")
@@ -506,69 +527,60 @@ for col, label, _ in pm_map:
 df = pd.DataFrame(data).sort_values("dt").reset_index(drop=True)
 
 # ---- Layout centrado: grilla 2x2 ----
+def plot_pm(df, pm_map, pm_band_choice, show_icca=True):
+    fig = go.Figure()
+    for _, label, color in pm_map:
+        fig.add_trace(go.Scatter(x=df["dt"], y=df[label], name=label, mode="lines",
+                                 line=dict(color=color, width=2.5 if label=="PM2.5" else 2)))
+    if show_icca:
+        x0, x1 = df["dt"].min(), df["dt"].max()
+        ranges = ICCA["PM2.5"] if pm_band_choice=="PM2.5" else ICCA["PM10"]
+        shapes, lines = make_bands(x0, x1, ranges, opacity=0.12)
+        fig.update_layout(shapes=shapes+lines)
+    fig.update_layout(title=f"Particulados — PM1 / PM2.5 / PM10 (Bandas ICCA: {pm_band_choice})",
+                      template="plotly_white", margin=dict(l=20,r=20,t=60,b=30),
+                      xaxis_title="Fecha/Hora", yaxis_title="Concentración (µg/m³)",
+                      height=350, legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="center", x=0.5))
+    return fig
+
 sp_left, center_col, sp_right = st.columns([0.1, 0.8, 0.1])
 with center_col:
     c1, c2 = st.columns(2, gap="large")
     with c1:
-        st.plotly_chart(make_pm_figure(df, pm_map, pm_band_choice, show_icca), use_container_width=True)
-
+        st.plotly_chart(plot_pm(df, pm_map, pm_band_choice, True), use_container_width=True)
     with c2:
         no2_icca = convert_icca_ranges_ppm(ICCA["NO2_ppm"], no2_unit, MW["NO2"])
-        st.plotly_chart(
-            make_line_figure(df["dt"], df["NO₂"], f"Dióxido de Nitrógeno — NO₂ ({no2_unit})",
-                             "#2A9D8F", f"Concentración ({no2_unit})",
-                             icca_ranges=no2_icca, show_icca=show_icca),
-            use_container_width=True
-        )
-
+        st.plotly_chart(make_line_figure(df["dt"], df["NO₂"], f"Dióxido de Nitrógeno — NO₂ ({no2_unit})",
+                                         "#2A9D8F", f"Concentración ({no2_unit})",
+                                         icca_ranges=no2_icca, show_icca=True),
+                        use_container_width=True)
     c3, c4 = st.columns(2, gap="large")
     with c3:
         so2_icca = convert_icca_ranges_ppm(ICCA["SO2_ppm"], so2_unit, MW["SO2"])
-        st.plotly_chart(
-            make_line_figure(df["dt"], df["SO₂"], f"Dióxido de Azufre — SO₂ ({so2_unit})",
-                             "#E76F51", f"Concentración ({so2_unit})",
-                             icca_ranges=so2_icca, show_icca=show_icca),
-            use_container_width=True
-        )
+        st.plotly_chart(make_line_figure(df["dt"], df["SO₂"], f"Dióxido de Azufre — SO₂ ({so2_unit})",
+                                         "#E76F51", f"Concentración ({so2_unit})",
+                                         icca_ranges=so2_icca, show_icca=True),
+                        use_container_width=True)
     with c4:
         o3_icca = convert_icca_ranges_ppm(ICCA["O3_ppm"], o3_unit, MW["O3"])
-        st.plotly_chart(
-            make_line_figure(df["dt"], df["O₃"], f"Ozono — O₃ ({o3_unit})",
-                             "#264653", f"Concentración ({o3_unit})",
-                             icca_ranges=o3_icca, show_icca=show_icca),
-            use_container_width=True
-        )
+        st.plotly_chart(make_line_figure(df["dt"], df["O₃"], f"Ozono — O₃ ({o3_unit})",
+                                         "#264653", f"Concentración ({o3_unit})",
+                                         icca_ranges=o3_icca, show_icca=True),
+                        use_container_width=True)
 
-# Estadísticas rápidas
+# Estadísticas rápidas (cadena en una sola línea para evitar SyntaxError)
 with st.expander("Estadísticas del mes (valores originales)"):
+    cols_for_stats = [lab for _, lab, _ in pm_map] + ["NO₃".replace("₃","₂").replace("NO₂","NO₂")]  # mantener consistencia visual
     cols_for_stats = [lab for _, lab, _ in pm_map] + ["NO₂","SO₂","O₃"]
     st.dataframe(
-        df[cols_for_stats].describe().T.rename(columns={
-            "mean":"media", "std":"desv.std", "min":"mín", "max":"máx"
-        })[["count","media","desv.std","mín","25%","50%","75%","máx"]]
+        df[cols_for_stats].describe().T.rename(
+            columns={"mean":"media", "std":"desv.std", "min":"mín", "max":"máx"}
+        )[["count","media","desv.std","mín","25%","50%","75%","máx"]]
     )
 
 # Descarga del CSV limpio
-safe_year = int(subset.iloc[0]['year']) if pd.notna(subset.iloc[0]['year']) else None
+safe_year  = int(subset.iloc[0]['year'])  if pd.notna(subset.iloc[0]['year'])  else None
 safe_month = int(subset.iloc[0]['month']) if pd.notna(subset.iloc[0]['month']) else None
-file_stub = f"clean_{row.get('sid') or 'NA'}_{safe_year or 'YYYY'}{(safe_month or 0):02d if safe_month else 'MM'}"
-
-st.download_button(
-    "Descargar CSV limpio (este archivo)",
-    data=df.to_csv(index=False),
-    file_name=f"{file_stub}.csv",
-    mime="text/csv"
-)
-
-with st.expander("Ayuda / Supuestos"):
-    st.markdown(f"""
-- Fuente: GitHub contents API → descarga directa **raw** (usa `GITHUB_TOKEN` si está disponible para evitar límites).
-- Limpieza EarthSense: se descartan metadatos superiores hasta encontrar la fila con **Date (Local)** y **UTC Time Stamp**.
-- Detección de tiempo: **UTC Time Stamp** si existe; si no, **Date (Local) + Time (Local)** (`dayfirst=True`).
-- **Bandas ICCA**:
-  - **Particulados** (PM10 y PM2.5) en **µg/m³** (rangos incluidos en el código).
-  - **Gases (NO₂, O₃, SO₂)**: ICCA en **ppm**, convertido automáticamente a la **unidad del CSV**:
-    - NO₂ ({no2_unit}), O₃ ({o3_unit}), SO₂ ({so2_unit}); CO soportado si está en el CSV.
-- Conversión (25°C, 1 atm): µg/m³ = ppm × MW × 1000 / 24.45; mg/m³ = ppm × MW / 24.45.
-- Si el nombre del archivo cumple `device_<id>_<YYYYMMDDHHMM>_<YYYYMMDDHHMM>_1hr.csv`, se usa para inferir Año/Mes; de lo contrario, se estima desde las fechas del CSV.
-""")
+file_stub  = f"clean_{row.get('sid') or 'NA'}_{safe_year or 'YYYY'}{(safe_month or 0):02d if safe_month else 'MM'}"
+st.download_button("Descargar CSV limpio (este archivo)", data=df.to_csv(index=False),
+                   file_name=f"{file_stub}.csv", mime="text/csv")
