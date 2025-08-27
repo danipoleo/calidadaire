@@ -1,6 +1,6 @@
 # app.py
 # Visor mensual 2x2 con bandas ICCA (PM1/PM2.5/PM10, NO2, SO2, O3)
-# Fuente: carpeta de GitHub (API -> fallback HTML -> raw URLs)
+# Fuente: carpeta de GitHub (Trees API -> HTML plain -> HTML normal -> Contents API)
 # Requisitos: streamlit, pandas, plotly, requests, python-dateutil
 
 import io
@@ -121,7 +121,7 @@ ICCA: Dict[str, List[Tuple[str, str, float, float]]] = {
         ("Amarillo",   "#FFC107", 0.066, 0.130),
         ("Anaranjado", "#FF9800", 0.131, 0.195),
         ("Rojo",       "#E53935", 0.196, 0.260),
-        ("Púrpura",    "#8E24AA", 0.260, math.inf),
+        ("Púrpura",    "#8E24AA", 0.260,  math.inf),
     ],
     "CO_ppm": [
         ("Verde",      "#00A65A", 0,     5.50),
@@ -217,35 +217,70 @@ def fetch_csv(url: str) -> pd.DataFrame:
             na_values=["N/A", "NA", "", "null", "None"],
         )
 
-def _list_with_api(owner: str, repo: str, path: str, branch: str):
-    """Devuelve lista con la Contents API o [] si no se puede (no levanta excepción)."""
-    url_api = f"https://api.github.com/repos/{owner}/{repo}/contents/{path}?ref={branch}"
-    headers = _gh_headers()
+# ------------- LISTADO DE ARCHIVOS EN GITHUB (robusto) -------------
+def _list_with_git_tree(owner: str, repo: str, branch: str, subpath: str):
+    """
+    Usa la Git Trees API para obtener todos los paths. Filtra por subpath y .csv (case-insensitive).
+    No levanta excepción; devuelve [] si falla (por ejemplo, rate limit).
+    """
+    url = f"https://api.github.com/repos/{owner}/{repo}/git/trees/{branch}?recursive=1"
     try:
-        r = requests.get(url_api, headers=headers, timeout=30)
+        r = requests.get(url, headers=_gh_headers(), timeout=30)
         if r.status_code == 403:
-            return []  # rate limit -> sin excepciones
+            return []
         r.raise_for_status()
-        items = r.json()
-        if isinstance(items, dict) and items.get("type") == "file":
-            items = [items]
-        return [
-            {
-                "name": it["name"],
-                "download_url": it.get("download_url"),
-                "path": it.get("path"),
-            }
-            for it in items
-            if it.get("type") == "file" and it.get("name", "").lower().endswith(".csv")
-        ]
+        data = r.json()
+        tree = data.get("tree", [])
+        sub = subpath.strip("/")
+        out = []
+        for node in tree:
+            p = node.get("path", "")
+            if node.get("type") == "blob" and p.lower().endswith(".csv"):
+                if not sub or p.startswith(sub + "/") or p == sub:
+                    name = p.split("/")[-1]
+                    out.append({"name": name,
+                                "download_url": f"https://raw.githubusercontent.com/{owner}/{repo}/{branch}/{p}",
+                                "path": p})
+        return out
     except Exception:
-        return []  # cualquier error -> [] y que el caller pruebe el HTML
+        return []
+
+def _list_with_html_plain(owner: str, repo: str, path: str, branch: str):
+    """
+    Parseo del HTML con ?plain=1 (más simple de parsear).
+    """
+    url_html = f"https://github.com/{owner}/{repo}/tree/{branch}/{path}".rstrip("/") + "?plain=1"
+    try:
+        rh = requests.get(url_html, timeout=30)
+        if rh.status_code >= 400:
+            return []
+        html = rh.text
+        path_prefix = path.strip("/")
+        if path_prefix:
+            path_prefix += "/"
+
+        # Busca enlaces a blob/.../<path_prefix>*.csv (insensible a mayúsculas)
+        pattern = re.compile(
+            rf'href="/{re.escape(owner)}/{re.escape(repo)}/blob/(?:[^"/]+/)*({re.escape(path_prefix)}[^"<>]+?\.csv)',
+            re.IGNORECASE,
+        )
+        matches = pattern.findall(html)
+        files, seen = [], set()
+        for rel in matches:
+            if rel in seen:
+                continue
+            seen.add(rel)
+            name = rel.split("/")[-1]
+            raw  = f"https://raw.githubusercontent.com/{owner}/{repo}/{branch}/{rel}"
+            files.append({"name": name, "download_url": raw, "path": rel})
+        return files
+    except Exception:
+        return []
 
 def _list_with_html(owner: str, repo: str, path: str, branch: str):
     """
-    Parsear la página HTML pública de GitHub para listar CSV (sin usar la API).
-    Funciona con enlaces tipo:
-      https://github.com/<owner>/<repo>/tree/<branch>/<path>
+    Parseo del HTML normal (sin ?plain=1).
+    Soporta variantes como blob/main/... o blob/refs/heads/main/...
     """
     url_html = f"https://github.com/{owner}/{repo}/tree/{branch}/{path}".rstrip("/")
     try:
@@ -253,18 +288,22 @@ def _list_with_html(owner: str, repo: str, path: str, branch: str):
         if rh.status_code >= 400:
             return []
         html = rh.text
-
-        # Normalizamos path: '', 'datos', 'datos/'...
         path_prefix = path.strip("/")
         if path_prefix:
             path_prefix += "/"
 
-        # Regex robusto: busca href="/<o>/<r>/blob/<b>/<path>/archivo.csv" (case-insensitive)
         pattern = re.compile(
-            rf'href="/{re.escape(owner)}/{re.escape(repo)}/blob/{re.escape(branch)}/({re.escape(path_prefix)}[^"<>]+?\.csv)',
+            rf'href="/{re.escape(owner)}/{re.escape(repo)}/blob/(?:refs/heads/)?{re.escape(branch)}/({re.escape(path_prefix)}[^"<>]+?\.csv)"',
             re.IGNORECASE,
         )
+        # Si no encuentra con branch literal, permitir cualquier segmento de branch (más laxo)
         matches = pattern.findall(html)
+        if not matches:
+            pattern2 = re.compile(
+                rf'href="/{re.escape(owner)}/{re.escape(repo)}/blob/(?:[^"/]+/)*({re.escape(path_prefix)}[^"<>]+?\.csv)"',
+                re.IGNORECASE,
+            )
+            matches = pattern2.findall(html)
 
         files, seen = [], set()
         for rel in matches:
@@ -278,16 +317,47 @@ def _list_with_html(owner: str, repo: str, path: str, branch: str):
     except Exception:
         return []
 
+def _list_with_contents_api(owner: str, repo: str, path: str, branch: str):
+    """
+    Contents API (último recurso).
+    """
+    url_api = f"https://api.github.com/repos/{owner}/{repo}/contents/{path}?ref={branch}"
+    try:
+        r = requests.get(url_api, headers=_gh_headers(), timeout=30)
+        if r.status_code == 403:
+            return []
+        r.raise_for_status()
+        items = r.json()
+        if isinstance(items, dict) and items.get("type") == "file":
+            items = [items]
+        return [
+            {"name": it["name"], "download_url": it.get("download_url"), "path": it.get("path")}
+            for it in items
+            if it.get("type") == "file" and str(it.get("name","")).lower().endswith(".csv")
+        ]
+    except Exception:
+        return []
+
 @st.cache_data(ttl=300, show_spinner=False)
-def github_list_files(owner: str, repo: str, path: str, branch: str, force_html: bool = True):
+def github_list_files(owner: str, repo: str, path: str, branch: str, prefer_git_tree: bool = True):
     """
-    Lista CSV en la carpeta usando:
-    - API (si no hay rate limit) salvo que force_html=True
-    - Fallback HTML si la API no devuelve nada
+    Estrategia de listado:
+      1) Git Trees API (recursive=1)
+      2) HTML plano (?plain=1)
+      3) HTML normal
+      4) Contents API
+    Devuelve [] si no encuentra nada.
     """
-    files = [] if force_html else _list_with_api(owner, repo, path, branch)
+    files = []
+    sub = path.strip("/")
+    if prefer_git_tree:
+        files = _list_with_git_tree(owner, repo, branch, sub)
+    if not files:
+        files = _list_with_html_plain(owner, repo, path, branch)
     if not files:
         files = _list_with_html(owner, repo, path, branch)
+    if not files:
+        files = _list_with_contents_api(owner, repo, path, branch)
     return files
 
 def raw_url(owner: str, repo: str, path: str, branch: str) -> str:
@@ -321,7 +391,7 @@ def convert_icca_ranges_ppm(ranges_ppm, target_unit, mw):
 
 def make_bands(x0, x1, ranges, opacity=0.12):
     shapes, lines = [], []
-    for label, color, lo, hi in ranges:
+    for _, color, lo, hi in ranges:
         y0 = -math.inf if lo is None else lo
         y1 =  math.inf if (hi is None or math.isinf(hi)) else hi
         shapes.append(dict(type="rect", xref="x", yref="y",
@@ -394,14 +464,8 @@ with st.sidebar:
     show_icca = st.checkbox("Mostrar bandas ICCA", value=True)
     pm_band_choice = st.radio("Umbral para fondo de particulados", ["PM2.5","PM10"], index=0)
 
-    st.caption("Opciones avanzadas:")
-    force_html = st.checkbox("Forzar fallback (HTML)", value=True)  # por defecto activado
-    if st.button("Recargar / limpiar caché"):
-        st.cache_data.clear()
-        st.success("Caché limpiada. Vuelve a seleccionar opciones si es necesario.")
-
     st.caption("También puedes pegar la URL de carpeta (opcional):")
-    gh_url = st.text_input("URL de carpeta (opcional)", value="", placeholder="https://github.com/owner/repo/tree/branch/carpeta")
+    gh_url = st.text_input("URL de carpeta", value="", placeholder="https://github.com/owner/repo/tree/branch/carpeta")
     if gh_url.strip():
         try:
             parts = gh_url.strip().split("github.com/")[-1].split("/")
@@ -413,8 +477,13 @@ with st.sidebar:
         except Exception:
             st.warning("No pude interpretar la URL; usando los campos owner/repo/ruta/branch.")
 
-# --- Listar archivos CSV (API -> fallback HTML, sin excepciones) ---
-files = github_list_files(owner, repo, path, branch, force_html=force_html)
+    st.divider()
+    if st.button("Recargar / limpiar caché"):
+        st.cache_data.clear()
+        st.success("Caché limpiada. Vuelve a seleccionar opciones si es necesario.")
+
+# --- Listar archivos CSV (árbol -> html plain -> html normal -> contents) ---
+files = github_list_files(owner, repo, path, branch, prefer_git_tree=True)
 
 if not files:
     st.error(
@@ -547,6 +616,12 @@ if len(pm_map) == 0:
     st.stop()
 
 # Detectar unidades (defaults razonables si no hay columnas de unidad)
+def unit_from_column(df, unit_col, default):
+    if unit_col and unit_col in df.columns:
+        v = df[unit_col].dropna().astype(str)
+        if len(v): return v.iloc[0].strip()
+    return default
+
 no2_unit = unit_from_column(df_raw, unit_cols.get("NO2"), "µg/m³")
 o3_unit  = unit_from_column(df_raw, unit_cols.get("O3"),  "µg/m³")
 so2_unit = unit_from_column(df_raw, unit_cols.get("SO2"), "µg/m³")
@@ -568,14 +643,14 @@ sp_left, center_col, sp_right = st.columns([0.1, 0.8, 0.1])
 with center_col:
     c1, c2 = st.columns(2, gap="large")
     with c1:
-        st.plotly_chart(make_pm_figure(df, pm_map, pm_band_choice, show_icca), use_container_width=True)
+        st.plotly_chart(make_pm_figure(df, pm_map, pm_band_choice, True), use_container_width=True)
 
     with c2:
         no2_icca = convert_icca_ranges_ppm(ICCA["NO2_ppm"], no2_unit, MW["NO2"])
         st.plotly_chart(
             make_line_figure(df["dt"], df["NO₂"], f"Dióxido de Nitrógeno — NO₂ ({no2_unit})",
                              "#2A9D8F", f"Concentración ({no2_unit})",
-                             icca_ranges=no2_icca, show_icca=show_icca),
+                             icca_ranges=no2_icca, show_icca=True),
             use_container_width=True
         )
 
@@ -585,7 +660,7 @@ with center_col:
         st.plotly_chart(
             make_line_figure(df["dt"], df["SO₂"], f"Dióxido de Azufre — SO₂ ({so2_unit})",
                              "#E76F51", f"Concentración ({so2_unit})",
-                             icca_ranges=so2_icca, show_icca=show_icca),
+                             icca_ranges=so2_icca, show_icca=True),
             use_container_width=True
         )
     with c4:
@@ -593,7 +668,7 @@ with center_col:
         st.plotly_chart(
             make_line_figure(df["dt"], df["O₃"], f"Ozono — O₃ ({o3_unit})",
                              "#264653", f"Concentración ({o3_unit})",
-                             icca_ranges=o3_icca, show_icca=show_icca),
+                             icca_ranges=o3_icca, show_icca=True),
             use_container_width=True
         )
 
@@ -620,7 +695,7 @@ st.download_button(
 
 with st.expander("Ayuda / Supuestos"):
     st.markdown(f"""
-- Si la API de GitHub tiene límite, este visor usa **fallback HTML** para listar CSV y construir **raw URLs**.
+- Listado de archivos: primero **Git Trees API** (paths recursivos), luego **HTML `?plain=1`**, después **HTML normal** y como último recurso **Contents API**.
 - Limpieza EarthSense: se descartan metadatos superiores hasta la fila con **Date (Local)** y **UTC Time Stamp**.
 - Detección de tiempo: **UTC Time Stamp** si existe; si no, **Date (Local) + Time (Local)** (`dayfirst=True`).
 - **Bandas ICCA**: particulados (PM10/PM2.5) en µg/m³; gases (NO₂/O₃/SO₂) a ppm convertidos a la unidad del CSV.
