@@ -3,3 +3,7 @@ pandas>=2.2
 plotly>=5.22
 requests>=2.32
 python-dateutil>=2.9
+streamlit>=1.36
+pandas>=2.2
+plotly>=5.22
+requests>=2.32
