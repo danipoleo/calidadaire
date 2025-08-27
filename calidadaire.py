@@ -18,7 +18,7 @@ import plotly.graph_objects as go
 # =================== CONFIG POR DEFECTO ===================
 DEFAULT_GITHUB_OWNER = "danipoleo"
 DEFAULT_GITHUB_REPO  = "calidadaire"
-DEFAULT_PATH_IN_REPO = "datosCA"  # ajusta aquí si cambias carpeta
+DEFAULT_PATH_IN_REPO = "datos"  # ajusta aquí si cambias carpeta
 DEFAULT_BRANCH       = "main"
 # ==========================================================
 
@@ -30,7 +30,7 @@ STATION_MAP: Dict[str, str] = {
     "1762": "Santa Lucía",
     "1775": "Belén CTP",
     "1776": "Fabio Baudrit",
-    "Z01777": "Municipalidad de Santa Ana",
+    "1777": "Municipalidad de Santa Ana",
 }
 
 # Columnas posibles (nombres varían por exporte)
