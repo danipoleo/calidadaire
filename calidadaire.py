@@ -30,7 +30,7 @@ STATION_MAP: Dict[str, str] = {
     "1762": "Santa Lucía",
     "1775": "Belén CTP",
     "1776": "Fabio Baudrit",
-    "1777": "Municipalidad de Santa Ana",
+    "Z01777": "Municipalidad de Santa Ana",
 }
 
 # Columnas posibles (nombres varían por exporte)
