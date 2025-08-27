@@ -1,6 +1,7 @@
 # app.py
-# Visor mensual 2x2 (PM1/PM2.5/PM10, NO2, SO2, O3) con bandas ICCA
-# Fuente: carpeta en GitHub (HTML scraping y/o API) con caché robusto
+# Visor mensual 2x2 con bandas ICCA (usa TODOS los device_*_1hr.csv de la carpeta)
+# Fuente: GitHub (HTML y/o API) + Plan B URL directa
+# Promedia múltiples estaciones seleccionadas (gases convertidos a µg/m³)
 
 import io
 import os
@@ -17,7 +18,7 @@ import plotly.graph_objects as go
 # =================== CONFIG POR DEFECTO ===================
 DEFAULT_GITHUB_OWNER = "danipoleo"
 DEFAULT_GITHUB_REPO  = "calidadaire"
-DEFAULT_PATH_IN_REPO = "datosCA"  # cambia a "datos" si es tu carpeta
+DEFAULT_PATH_IN_REPO = "datosCA"   # usa "datos" si es tu carpeta actual
 DEFAULT_BRANCH       = "main"
 # ==========================================================
 
@@ -102,7 +103,7 @@ def find_column(df: pd.DataFrame, options: List[str]) -> Optional[str]:
 
 def _clean_earthsense_text(txt: str) -> str:
     txt = txt.replace("\r\n", "\n").replace("\r", "\n")
-    if txt.startswith("\ufeff"):
+    if txt.startswith("\ufeff"):  # BOM
         txt = txt.lstrip("\ufeff")
     lines = txt.split("\n")
     header_idx = None
@@ -132,7 +133,6 @@ def fetch_csv(url: str) -> pd.DataFrame:
         return pd.read_csv(io.StringIO(clean_txt), engine="python", sep=";", quotechar='"',
                            on_bad_lines="skip", na_values=["N/A","NA","","null","None"])
 
-# -------- Helpers para normalizar rutas del HTML/URLs --------
 def _normalize_rel_for_raw(rel: str, branch: str) -> str:
     if not rel: return rel
     rel = rel.lstrip("/")
@@ -157,30 +157,7 @@ def _raw_from_blob_or_raw(owner: str, repo: str, branch: str, url: str) -> str:
         return f"https://raw.githubusercontent.com/{owner}/{repo}/{branch}/{rel}"
     return url.split("?", 1)[0]
 
-# ------------- LISTADO DE ARCHIVOS EN GITHUB (múltiples estrategias) -------------
-def _list_with_git_tree(owner: str, repo: str, branch: str, subpath: str):
-    url = f"https://api.github.com/repos/{owner}/{repo}/git/trees/{branch}?recursive=1"
-    try:
-        r = requests.get(url, headers=_gh_headers(), timeout=30)
-        if r.status_code == 403:
-            return [], {"status": 403, "where": "git_tree"}
-        r.raise_for_status()
-        data = r.json()
-        tree = data.get("tree", [])
-        sub  = subpath.strip("/")
-        out  = []
-        for node in tree:
-            p = node.get("path", "")
-            if node.get("type") == "blob" and p.lower().endswith(".csv"):
-                if not sub or p.startswith(sub + "/") or p == sub:
-                    name = p.split("/")[-1]
-                    out.append({"name": name,
-                                "download_url": f"https://raw.githubusercontent.com/{owner}/{repo}/{branch}/{p}",
-                                "path": p})
-        return out, {"status": r.status_code, "where": "git_tree", "count": len(out)}
-    except Exception as e:
-        return [], {"status": "ERR", "where": "git_tree", "error": str(e)}
-
+# --------- LISTADO DE ARCHIVOS (HTML y/o API) ----------
 def _extract_csv_links(html: str) -> List[str]:
     return re.findall(r'href="([^"]+?/blob/[^"]+?\.csv[^"]*)"', html, flags=re.IGNORECASE)
 
@@ -198,8 +175,10 @@ def _list_with_html_plain(owner: str, repo: str, path: str, branch: str):
             rel = h.split("/blob/", 1)[-1].split("?", 1)[0]
             rel = _normalize_rel_for_raw(rel, branch)
             name = rel.split("/")[-1]
+            if not FILENAME_REGEX.match(name or ""):
+                continue
             raw  = f"https://raw.githubusercontent.com/{owner}/{repo}/{branch}/{rel}"
-            if name.lower().endswith(".csv") and rel not in seen:
+            if rel not in seen:
                 seen.add(rel)
                 files.append({"name": name, "download_url": raw, "path": rel})
         return files, {"status": r.status_code, "where": "html_plain", "count": len(files)}
@@ -220,13 +199,40 @@ def _list_with_html(owner: str, repo: str, path: str, branch: str):
             rel = h.split("/blob/", 1)[-1].split("?", 1)[0]
             rel = _normalize_rel_for_raw(rel, branch)
             name = rel.split("/")[-1]
+            if not FILENAME_REGEX.match(name or ""):
+                continue
             raw  = f"https://raw.githubusercontent.com/{owner}/{repo}/{branch}/{rel}"
-            if name.lower().endswith(".csv") and rel not in seen:
+            if rel not in seen:
                 seen.add(rel)
                 files.append({"name": name, "download_url": raw, "path": rel})
         return files, {"status": r.status_code, "where": "html", "count": len(files)}
     except Exception as e:
         return [], {"status": "ERR", "where": "html", "error": str(e)}
+
+def _list_with_git_tree(owner: str, repo: str, branch: str, subpath: str):
+    url = f"https://api.github.com/repos/{owner}/{repo}/git/trees/{branch}?recursive=1"
+    try:
+        r = requests.get(url, headers=_gh_headers(), timeout=30)
+        if r.status_code == 403:
+            return [], {"status": 403, "where": "git_tree"}
+        r.raise_for_status()
+        data = r.json()
+        tree = data.get("tree", [])
+        sub  = subpath.strip("/")
+        out  = []
+        for node in tree:
+            p = node.get("path", "")
+            name = p.split("/")[-1]
+            if node.get("type") == "blob" and name.lower().endswith(".csv"):
+                if not sub or p.startswith(sub + "/") or p == sub:
+                    if not FILENAME_REGEX.match(name or ""):
+                        continue
+                    out.append({"name": name,
+                                "download_url": f"https://raw.githubusercontent.com/{owner}/{repo}/{branch}/{p}",
+                                "path": p})
+        return out, {"status": r.status_code, "where": "git_tree", "count": len(out)}
+    except Exception as e:
+        return [], {"status": "ERR", "where": "git_tree", "error": str(e)}
 
 def _list_with_contents_api(owner: str, repo: str, path: str, branch: str):
     url = f"https://api.github.com/repos/{owner}/{repo}/contents/{path}?ref={branch}"
@@ -238,11 +244,13 @@ def _list_with_contents_api(owner: str, repo: str, path: str, branch: str):
         items = r.json()
         if isinstance(items, dict) and items.get("type") == "file":
             items = [items]
-        files = [
-            {"name": it["name"], "download_url": it.get("download_url"), "path": it.get("path")}
-            for it in items
-            if it.get("type") == "file" and str(it.get("name","")).lower().endswith(".csv")
-        ]
+        files = []
+        for it in items:
+            if it.get("type") != "file":
+                continue
+            name = str(it.get("name",""))
+            if name.lower().endswith(".csv") and FILENAME_REGEX.match(name):
+                files.append({"name": name, "download_url": it.get("download_url"), "path": it.get("path")})
         return files, {"status": r.status_code, "where": "contents_api", "count": len(files)}
     except Exception as e:
         return [], {"status": "ERR", "where": "contents_api", "error": str(e)}
@@ -260,7 +268,6 @@ def github_list_files(owner: str, repo: str, path: str, branch: str,
         return f
 
     if prefer_html or not token_present:
-        # Prioriza HTML (no consume API)
         files = try_and_log(_list_with_html_plain, owner, repo, path, branch)
         if not files:
             files = try_and_log(_list_with_html, owner, repo, path, branch)
@@ -269,7 +276,6 @@ def github_list_files(owner: str, repo: str, path: str, branch: str,
             if not files:
                 files = try_and_log(_list_with_git_tree, owner, repo, branch, path)
     else:
-        # Con token, intenta API primero
         files = try_and_log(_list_with_git_tree, owner, repo, branch, path)
         if not files:
             files = try_and_log(_list_with_contents_api, owner, repo, path, branch)
@@ -280,7 +286,7 @@ def github_list_files(owner: str, repo: str, path: str, branch: str,
 
     return files, debug
 
-# ================ Conversión ICCA (definida ANTES de usarse) ================
+# ================ Conversión y figuras ================
 def convert_icca_ranges_ppm(ranges_ppm, target_unit, mw):
     tu = (target_unit or "").lower().replace("ug/m3","µg/m³").replace("ug/m³","µg/m³")
     out = []
@@ -324,12 +330,14 @@ def make_line_figure(x, y, title, color, y_title, icca_ranges=None, show_icca=Tr
         fig.update_layout(shapes=shapes + lines)
     return fig
 
-def make_pm_figure(df, pm_map, pm_band_choice, show_icca=True):
+def make_pm_figure(df, pm_labels, pm_band_choice, show_icca=True):
     fig = go.Figure()
-    for _, label, color in pm_map:
-        lw = 2.5 if label == "PM2.5" else 2
-        fig.add_trace(go.Scatter(x=df["dt"], y=df[label], name=label, mode="lines",
-                                 line=dict(color=color, width=lw)))
+    color_map = {"PM1":"#8ECAE6","PM2.5":"#FB8500","PM10":"#219EBC"}
+    for label in pm_labels:
+        if label in df.columns:
+            lw = 2.5 if label == "PM2.5" else 2
+            fig.add_trace(go.Scatter(x=df["dt"], y=df[label], name=label, mode="lines",
+                                     line=dict(color=color_map[label], width=lw)))
     if show_icca:
         x0, x1 = df["dt"].min(), df["dt"].max()
         icca_ranges = ICCA["PM2.5"] if pm_band_choice == "PM2.5" else ICCA["PM10"]
@@ -347,7 +355,7 @@ st.markdown("""<style>.block-container{max-width:1200px;margin:0 auto;}h1,h2,h3{
             unsafe_allow_html=True)
 
 st.title("Visor mensual de calidad de aire — Fuente: GitHub")
-st.caption("Lista CSV desde la carpeta del repo y grafica 2×2 con bandas ICCA.")
+st.caption("Usa TODOS los 'device_*_1hr.csv' de la carpeta; permite promediar varias estaciones.")
 
 with st.sidebar:
     st.header("Fuente de datos (GitHub)")
@@ -376,16 +384,14 @@ with st.sidebar:
                               help="Útil si no tienes GITHUB_TOKEN o ves rate limits.")
     direct_csv_url = st.text_input("Plan B: URL directa a un CSV (raw o blob)", value="",
                                    placeholder="https://github.com/.../blob/main/datosCA/device_...csv")
-
     st.divider()
     show_icca = st.checkbox("Mostrar bandas ICCA", value=True)
     pm_band_choice = st.radio("Umbral fondo particulados", ["PM2.5","PM10"], index=0)
-
     if st.button("Recargar / limpiar caché"):
         st.cache_data.clear()
         st.success("Caché limpiada.")
 
-# --- Listar CSV usando la función CACHEADA y el modo elegido ---
+# --- Listar CSV (solo los que cumplen el patrón device_*_1hr.csv) ---
 files, debug = github_list_files(owner, repo, path, branch, prefer_html, token_present)
 
 with st.expander("Diagnóstico de listado"):
@@ -393,19 +399,22 @@ with st.expander("Diagnóstico de listado"):
               "prefer_html": prefer_html, "token_present": token_present})
     st.write(debug)
 
+if not files and direct_csv_url.strip():
+    raw = _raw_from_blob_or_raw(owner, repo, branch, direct_csv_url.strip())
+    name = raw.split("/")[-1].split("?")[0]
+    if FILENAME_REGEX.match(name):
+        files = [{"name": name, "download_url": raw, "path": raw}]
+
 if not files:
-    if direct_csv_url.strip():
-        raw = _raw_from_blob_or_raw(owner, repo, branch, direct_csv_url.strip())
-        files = [{"name": raw.split("/")[-1].split("?")[0], "download_url": raw, "path": raw}]
-    else:
-        st.error("No encontré CSV. Verifica branch/carpeta o pega una URL directa en 'Plan B'.")
-        st.stop()
+    st.error("No encontré CSV con el patrón device_*_1hr.csv. Verifica branch/carpeta o usa 'Plan B'.")
+    st.stop()
 
 # Construir índice e intentar parsear año/mes del nombre
 rows = []
 for f in files:
     fname = f.get("name") or ""
-    if not fname: continue
+    if not fname or not FILENAME_REGEX.match(fname):
+        continue
     meta = parse_from_filename(fname)
     sid = meta["sid"]; station = STATION_MAP.get(sid, sid if sid else "Desconocida")
     url = f.get("download_url") or f"https://raw.githubusercontent.com/{owner}/{repo}/{branch}/{f.get('path','')}"
@@ -414,37 +423,14 @@ for f in files:
                  "year": meta["year"], "month": meta["month"]})
 files_df = pd.DataFrame(rows)
 if files_df.empty:
-    st.error("No se pudo construir el índice de archivos."); st.stop()
+    st.error("No se pudo construir índice; revisa nombres de archivo.")
+    st.stop()
 
-# Si falta año/mes, inferir desde el CSV
-if files_df["year"].isna().any() or files_df["month"].isna().any():
-    need_rows = files_df[files_df["year"].isna() | files_df["month"].isna()]
-    for i, r in need_rows.iterrows():
-        try:
-            tmp = fetch_csv(r["url"])
-            col_utc  = find_column(tmp, COL_CANDIDATES["UTC"])
-            col_date = find_column(tmp, COL_CANDIDATES["DATE"])
-            col_time = find_column(tmp, COL_CANDIDATES["TIME"])
-            if col_utc is not None:
-                dt = pd.to_datetime(tmp[col_utc], errors="coerce", utc=True).dt.tz_convert(None)
-            elif (col_date is not None) and (col_time is not None):
-                dt = pd.to_datetime(tmp[col_date].astype(str)+" "+tmp[col_time].astype(str),
-                                    errors="coerce", dayfirst=True)
-            else:
-                dt = pd.Series([], dtype="datetime64[ns]")
-            dt = pd.Series(dt).dropna()
-            if not dt.empty:
-                files_df.at[i, "dt_start"] = dt.min()
-                files_df.at[i, "dt_end"]   = dt.max()
-                files_df.at[i, "year"]     = int(dt.min().year)
-                files_df.at[i, "month"]    = int(dt.min().month)
-        except Exception:
-            pass
-
-# Controles (Año/Mes/Estación)
+# Controles (Año/Mes/Estación MÚLTIPLE)
 valid_years = sorted([int(y) for y in files_df["year"].dropna().unique()], reverse=True)
 if not valid_years:
-    st.error("No pude resolver año/mes. Revisa patrón de nombre o usa 'Plan B' con un CSV puntual."); st.stop()
+    st.error("No pude resolver año/mes desde los nombres.")
+    st.stop()
 
 year_sel = st.selectbox("Año", valid_years)
 month_names = {1:"Enero",2:"Febrero",3:"Marzo",4:"Abril",5:"Mayo",6:"Junio",
@@ -457,121 +443,185 @@ if subset.empty:
     st.warning("No hay archivos para ese año/mes."); st.stop()
 
 subset = subset.copy()
-subset["label"] = subset.apply(lambda r: f"{(r['station'] or 'Desconocida')} ({r['sid']})" if pd.notna(r["sid"]) else r["name"], axis=1)
-station_label = st.selectbox("Estación", list(subset["label"]))
-row = subset[subset["label"] == station_label].iloc[0]
+subset["label"] = subset.apply(lambda r: f"{(r['station'] or 'Desconocida')} ({r['sid']})", axis=1)
+all_labels = list(subset["label"])
 
-st.caption(f"Archivo: `{row['name']}` · Estación: **{row['station']}** · Periodo: {row['dt_start']} → {row['dt_end']}")
+sel_labels = st.multiselect("Estaciones (puedes elegir varias; promedio en gráficos)", 
+                            options=all_labels, default=all_labels)
 
-# Cargar CSV elegido
-try:
-    df_raw = fetch_csv(row["url"])
-except Exception as e:
-    st.error(f"No pude descargar/leer el CSV: {row['url']}\nDetalle: {e}"); st.stop()
+if not sel_labels:
+    st.warning("Selecciona al menos una estación."); st.stop()
 
-# Resolver fecha/hora
-col_utc  = find_column(df_raw, COL_CANDIDATES["UTC"])
-col_date = find_column(df_raw, COL_CANDIDATES["DATE"])
-col_time = find_column(df_raw, COL_CANDIDATES["TIME"])
-if col_utc is not None:
-    dt = pd.to_datetime(df_raw[col_utc], errors="coerce", utc=True).dt.tz_convert(None)
-elif (col_date is not None) and (col_time is not None):
-    dt = pd.to_datetime(df_raw[col_date].astype(str)+" "+df_raw[col_time].astype(str),
-                        errors="coerce", dayfirst=True)
-else:
-    st.error("No encontré columnas de tiempo (UTC o Date+Time)."); st.stop()
+chosen = subset[subset["label"].isin(sel_labels)].reset_index(drop=True)
 
-# Mapear columnas
-mapped = {k: find_column(df_raw, COL_CANDIDATES[k]) for k in ["PM1","PM25","PM10","NO2","SO2","O3","CO"]}
-unit_cols = {
-    "NO2": find_column(df_raw, COL_CANDIDATES["NO2_UNIT"]),
-    "SO2": find_column(df_raw, COL_CANDIDATES["SO2_UNIT"]),
-    "O3":  find_column(df_raw, COL_CANDIDATES["O3_UNIT"]),
-    "CO":  find_column(df_raw, COL_CANDIDATES["CO_UNIT"]),
-    "PM1": find_column(df_raw, COL_CANDIDATES["PM1_UNIT"]),
-    "PM25":find_column(df_raw, COL_CANDIDATES["PM25_UNIT"]),
-    "PM10":find_column(df_raw, COL_CANDIDATES["PM10_UNIT"]),
-}
-no2_col, so2_col, o3_col = mapped.get("NO2"), mapped.get("SO2"), mapped.get("O3")
-gases_missing = [name for name, col in {"NO₂":no2_col,"SO₂":so2_col,"O₃":o3_col}.items() if col is None]
-if gases_missing:
-    st.error("El CSV no contiene: " + ", ".join(gases_missing)); st.stop()
-
-pm_map=[]
-if mapped.get("PM1"):  pm_map.append((mapped["PM1"],  "PM1",   "#8ECAE6"))
-if mapped.get("PM25"): pm_map.append((mapped["PM25"], "PM2.5", "#FB8500"))
-if mapped.get("PM10"): pm_map.append((mapped["PM10"], "PM10",  "#219EBC"))
-if len(pm_map)==0:
-    st.error("No se encontraron columnas de particulado (PM1/PM2.5/PM10) en el CSV."); st.stop()
-
-# Unidades
-def unit_from_column2(df, unit_col, default):
+# ---- Carga y normalización de CADA archivo; gases -> µg/m³ ----
+def _unit_from_column(df, unit_col, default):
     if unit_col and unit_col in df.columns:
         v = df[unit_col].dropna().astype(str)
         if len(v): return v.iloc[0].strip()
     return default
 
-no2_unit = unit_from_column2(df_raw, unit_cols.get("NO2"), "µg/m³")
-o3_unit  = unit_from_column2(df_raw, unit_cols.get("O3"),  "µg/m³")
-so2_unit = unit_from_column2(df_raw, unit_cols.get("SO2"), "µg/m³")
-co_unit  = unit_from_column2(df_raw, unit_cols.get("CO"),  "mg/m³")
+def _to_ugm3(series: pd.Series, from_unit: str, mw: float) -> pd.Series:
+    fu = (from_unit or "").lower().replace("ug/m3","µg/m³").replace("ug/m³","µg/m³")
+    if fu in ["µg/m³", "μg/m³", "ug/m3", "ug/m³", "μg/m3"]:
+        return pd.to_numeric(series, errors="coerce")
+    if fu == "ppm":
+        factor = mw * 1000.0 / 24.45
+        return pd.to_numeric(series, errors="coerce") * factor
+    if fu in ["mg/m³", "mg/m3"]:
+        factor = 1000.0  # mg/m³ -> µg/m³
+        return pd.to_numeric(series, errors="coerce") * factor
+    # si desconocida, no convierto
+    return pd.to_numeric(series, errors="coerce")
 
-# DataFrame final
-data = {"dt": dt,
-        "NO₂": pd.to_numeric(df_raw[no2_col], errors="coerce"),
-        "SO₂": pd.to_numeric(df_raw[so2_col], errors="coerce"),
-        "O₃":  pd.to_numeric(df_raw[o3_col],  errors="coerce")}
-for col, label, _ in pm_map:
-    data[label] = pd.to_numeric(df_raw[col], errors="coerce")
-df = pd.DataFrame(data).sort_values("dt").reset_index(drop=True)
+def load_one(url: str):
+    df_raw = fetch_csv(url)
 
-# ---- Gráficas ----
+    col_utc  = find_column(df_raw, COL_CANDIDATES["UTC"])
+    col_date = find_column(df_raw, COL_CANDIDATES["DATE"])
+    col_time = find_column(df_raw, COL_CANDIDATES["TIME"])
+    if col_utc is not None:
+        dt = pd.to_datetime(df_raw[col_utc], errors="coerce", utc=True).dt.tz_convert(None)
+    elif (col_date is not None) and (col_time is not None):
+        dt = pd.to_datetime(df_raw[col_date].astype(str)+" "+df_raw[col_time].astype(str),
+                            errors="coerce", dayfirst=True)
+    else:
+        raise ValueError("No encontré columnas de tiempo (UTC o Date+Time).")
+
+    mapped = {k: find_column(df_raw, COL_CANDIDATES[k]) for k in ["PM1","PM25","PM10","NO2","SO2","O3","CO"]}
+    unit_cols = {
+        "NO2": find_column(df_raw, COL_CANDIDATES["NO2_UNIT"]),
+        "SO2": find_column(df_raw, COL_CANDIDATES["SO2_UNIT"]),
+        "O3":  find_column(df_raw, COL_CANDIDATES["O3_UNIT"]),
+        "CO":  find_column(df_raw, COL_CANDIDATES["CO_UNIT"]),
+        "PM1": find_column(df_raw, COL_CANDIDATES["PM1_UNIT"]),
+        "PM25":find_column(df_raw, COL_CANDIDATES["PM25_UNIT"]),
+        "PM10":find_column(df_raw, COL_CANDIDATES["PM10_UNIT"]),
+    }
+    no2_col, so2_col, o3_col = mapped.get("NO2"), mapped.get("SO2"), mapped.get("O3")
+    # si faltan gases, lo omito (pero no reviento)
+    gases_ok = all([no2_col, so2_col, o3_col])
+
+    # PM: asumo µg/m³ ya
+    data = {"dt": dt}
+    if mapped.get("PM1"):  data["PM1"]  = pd.to_numeric(df_raw[mapped["PM1"]], errors="coerce")
+    if mapped.get("PM25"): data["PM2.5"]= pd.to_numeric(df_raw[mapped["PM25"]], errors="coerce")
+    if mapped.get("PM10"): data["PM10"] = pd.to_numeric(df_raw[mapped["PM10"]], errors="coerce")
+
+    if gases_ok:
+        no2_unit = _unit_from_column(df_raw, unit_cols.get("NO2"), "µg/m³")
+        so2_unit = _unit_from_column(df_raw, unit_cols.get("SO2"), "µg/m³")
+        o3_unit  = _unit_from_column(df_raw, unit_cols.get("O3"),  "µg/m³")
+        data["NO2_µg/m³"] = _to_ugm3(df_raw[no2_col], no2_unit, MW["NO2"])
+        data["SO2_µg/m³"] = _to_ugm3(df_raw[so2_col], so2_unit, MW["SO2"])
+        data["O3_µg/m³"]  = _to_ugm3(df_raw[o3_col],  o3_unit,  MW["O3"])
+
+    df = pd.DataFrame(data).dropna(subset=["dt"]).sort_values("dt")
+    return df, gases_ok
+
+loaded, used, skipped = [], 0, 0
+errors = []
+for _, r in chosen.iterrows():
+    try:
+        dfi, gases_ok = load_one(r["url"])
+        if not gases_ok:
+            skipped += 1
+            errors.append(f"Omitido (sin NO2/SO2/O3): {r['name']}")
+            continue
+        loaded.append(dfi.set_index("dt"))
+        used += 1
+    except Exception as e:
+        skipped += 1
+        errors.append(f"Error con {r['name']}: {e}")
+
+if not loaded:
+    st.error("No se pudo cargar ninguna estación válida para ese mes (faltan gases o errores de lectura).")
+    if errors: st.write(errors)
+    st.stop()
+
+# Unir por índice de tiempo y promediar columnas homónimas
+wide = pd.concat(loaded, axis=1)
+# Promedios ignorando NaN
+def _avg(cols):
+    return wide[cols].mean(axis=1, skipna=True) if any(c in wide.columns for c in cols) else pd.Series(dtype="float64")
+
+avg = pd.DataFrame(index=wide.index)
+pm_labels = []
+for lab in ["PM1","PM2.5","PM10"]:
+    cols = [c for c in wide.columns if c.endswith(lab)]
+    # si el CSV de cada estación no repite sufijos, seleccione por nombre exacto
+    if not cols:
+        cols = [c for c in wide.columns if c.split("_")[-1] == lab or c == lab]
+    if any(lab == c or c.endswith(lab) for c in wide.columns):
+        # normalizar nombres columna: exactos lab
+        # intentamos columnas exactas:
+        cand = [c for c in wide.columns if c == lab]
+        if cand:
+            avg[lab] = _avg(cand)
+        else:
+            cand = [c for c in wide.columns if c.endswith(lab)]
+            avg[lab] = _avg(cand)
+        pm_labels.append(lab)
+
+for gas in ["NO2","SO2","O3"]:
+    cols = [c for c in wide.columns if c.startswith(f"{gas}_")]
+    if cols:
+        avg[gas] = _avg(cols)
+
+avg = avg.reset_index().rename(columns={"index":"dt"})
+avg = avg.sort_values("dt")
+
+# ---- Render UI / Info de selección ----
+st.caption(f"Archivos seleccionados: {used} usados · {skipped} omitidos")
+if errors:
+    with st.expander("Detalles de archivos omitidos / errores"):
+        for e in errors:
+            st.write("- " + e)
+
+# ---- Figuras (ICCA en µg/m³ para gases) ----
 sp_left, center_col, sp_right = st.columns([0.1,0.8,0.1])
 with center_col:
     c1, c2 = st.columns(2, gap="large")
     with c1:
-        st.plotly_chart(make_pm_figure(df, pm_map, pm_band_choice, show_icca), use_container_width=True)
+        st.plotly_chart(make_pm_figure(avg, pm_labels, pm_band_choice, show_icca), use_container_width=True)
     with c2:
-        no2_icca = convert_icca_ranges_ppm(ICCA["NO2_ppm"], no2_unit, MW["NO2"])
+        no2_icca = convert_icca_ranges_ppm(ICCA["NO2_ppm"], "µg/m³", MW["NO2"])
         st.plotly_chart(
-            make_line_figure(df["dt"], df["NO₂"], f"NO₂ ({no2_unit})",
-                             "#2A9D8F", f"Concentración ({no2_unit})",
+            make_line_figure(avg["dt"], avg["NO2"], f"NO₂ (µg/m³)",
+                             "#2A9D8F", "Concentración (µg/m³)",
                              icca_ranges=no2_icca, show_icca=show_icca),
             use_container_width=True
         )
     c3, c4 = st.columns(2, gap="large")
     with c3:
-        so2_icca = convert_icca_ranges_ppm(ICCA["SO2_ppm"], so2_unit, MW["SO2"])
+        so2_icca = convert_icca_ranges_ppm(ICCA["SO2_ppm"], "µg/m³", MW["SO2"])
         st.plotly_chart(
-            make_line_figure(df["dt"], df["SO₂"], f"SO₂ ({so2_unit})",
-                             "#E76F51", f"Concentración ({so2_unit})",
+            make_line_figure(avg["dt"], avg["SO2"], f"SO₂ (µg/m³)",
+                             "#E76F51", "Concentración (µg/m³)",
                              icca_ranges=so2_icca, show_icca=show_icca),
             use_container_width=True
         )
     with c4:
-        o3_icca = convert_icca_ranges_ppm(ICCA["O3_ppm"], o3_unit, MW["O3"])
+        o3_icca = convert_icca_ranges_ppm(ICCA["O3_ppm"], "µg/m³", MW["O3"])
         st.plotly_chart(
-            make_line_figure(df["dt"], df["O₃"], f"O₃ ({o3_unit})",
-                             "#264653", f"Concentración ({o3_unit})",
+            make_line_figure(avg["dt"], avg["O3"], f"O₃ (µg/m³)",
+                             "#264653", "Concentración (µg/m³)",
                              icca_ranges=o3_icca, show_icca=show_icca),
             use_container_width=True
         )
 
 # Estadísticas
-with st.expander("Estadísticas del mes (valores originales)"):
-    cols_for_stats = [lab for _, lab, _ in pm_map] + ["NO₂","SO₂","O₃"]
+with st.expander("Estadísticas del mes (promedio de estaciones seleccionadas)"):
+    cols_for_stats = [c for c in ["PM1","PM2.5","PM10","NO2","SO2","O3"] if c in avg.columns]
     st.dataframe(
-        df[cols_for_stats].describe().T.rename(
+        avg[cols_for_stats].describe().T.rename(
             columns={"mean":"media","std":"desv.std","min":"mín","max":"máx"}
         )[["count","media","desv.std","mín","25%","50%","75%","máx"]]
     )
 
-# Descarga del CSV limpio
-safe_year  = int(subset.iloc[0]['year'])  if pd.notna(subset.iloc[0]['year'])  else None
-safe_month = int(subset.iloc[0]['month']) if pd.notna(subset.iloc[0]['month']) else None
-year_str   = f"{safe_year}"      if safe_year  is not None else "YYYY"
-month_str  = f"{safe_month:02d}" if safe_month is not None else "MM"
-sid_str    = row.get('sid') or 'NA'
-file_stub  = f"clean_{sid_str}_{year_str}{month_str}"
-st.download_button("Descargar CSV limpio (este archivo)", data=df.to_csv(index=False),
+# Descarga del CSV promedio
+year_str  = f"{int(year_sel)}"
+month_str = f"{int(month_sel):02d}"
+file_stub = f"clean_PROM_{year_str}{month_str}"
+st.download_button("Descargar CSV limpio (promedio seleccionado)", data=avg.to_csv(index=False),
                    file_name=f"{file_stub}.csv", mime="text/csv")
