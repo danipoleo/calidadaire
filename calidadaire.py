@@ -1,6 +1,7 @@
 # app.py
 # Visor mensual 2x2 con bandas ICCA (PM1/PM2.5/PM10, NO2, SO2, O3)
-# Fuente: carpeta de GitHub (Trees API -> HTML plain -> HTML normal -> Contents API)
+# Listado robusto (Git Trees API -> HTML ?plain=1 -> HTML normal -> Contents API)
+# y normalización de rutas para evitar 'main/main' al construir raw URLs.
 
 import io
 import os
@@ -17,7 +18,7 @@ import plotly.graph_objects as go
 # =================== CONFIG POR DEFECTO ===================
 DEFAULT_GITHUB_OWNER = "danipoleo"
 DEFAULT_GITHUB_REPO  = "calidadaire"
-DEFAULT_PATH_IN_REPO = "datosCA"
+DEFAULT_PATH_IN_REPO = "datosCA"  # <- nuevo default
 DEFAULT_BRANCH       = "main"
 # ==========================================================
 
@@ -136,7 +137,53 @@ def fetch_csv(url: str) -> pd.DataFrame:
         return pd.read_csv(io.StringIO(clean_txt), engine="python", sep=";", quotechar='"',
                            on_bad_lines="skip", na_values=["N/A","NA","","null","None"])
 
+# -------- Helpers para normalizar rutas del HTML/URLs --------
+
+def _normalize_rel_for_raw(rel: str, branch: str) -> str:
+    """
+    Normaliza lo que viene después de /blob/ en enlaces HTML de GitHub.
+    - Elimina 'refs/heads/' si está presente.
+    - Si empieza con '<branch>/', lo quita para no duplicar el branch al construir la raw URL.
+    """
+    if not rel:
+        return rel
+    rel = rel.lstrip("/")
+    if rel.startswith("refs/heads/"):
+        rel = rel[len("refs/heads/"):]
+    # Si rel ya incluye 'branch/...', lo retiramos:
+    prefix = f"{branch}/"
+    if rel.startswith(prefix):
+        rel = rel[len(prefix):]
+    return rel
+
+def _to_tree_url_if_blob(url: str) -> str:
+    """
+    Si el usuario pega una URL de carpeta con 'blob', la cambiamos a 'tree'.
+    También normaliza dobles '/' y quita queries.
+    """
+    if not url:
+        return url
+    u = url.split("?", 1)[0]
+    u = u.replace("/blob/", "/tree/")
+    # asegurar que termina sin barullo
+    return u
+
+def _raw_from_blob_or_raw(owner: str, repo: str, branch: str, url: str) -> str:
+    """
+    Convierte una URL 'blob' a 'raw' correctamente (sin duplicar branch).
+    Si ya es raw, la retorna tal cual.
+    """
+    if "raw.githubusercontent.com" in url:
+        return url.split("?", 1)[0]
+    if "/blob/" in url:
+        rel = url.split("/blob/", 1)[-1].split("?", 1)[0]  # e.g. 'main/datosCA/file.csv' o 'refs/heads/main/datosCA/file.csv'
+        rel = _normalize_rel_for_raw(rel, branch)
+        return f"https://raw.githubusercontent.com/{owner}/{repo}/{branch}/{rel}"
+    # Si es otra cosa, lo devolvemos por si ya es un raw firmado u otra CDN
+    return url.split("?", 1)[0]
+
 # ------------- LISTADO DE ARCHIVOS EN GITHUB (robusto) -------------
+
 def _list_with_git_tree(owner: str, repo: str, branch: str, subpath: str):
     url = f"https://api.github.com/repos/{owner}/{repo}/git/trees/{branch}?recursive=1"
     try:
@@ -153,9 +200,11 @@ def _list_with_git_tree(owner: str, repo: str, branch: str, subpath: str):
             if node.get("type") == "blob" and p.lower().endswith(".csv"):
                 if not sub or p.startswith(sub + "/") or p == sub:
                     name = p.split("/")[-1]
-                    out.append({"name": name,
-                                "download_url": f"https://raw.githubusercontent.com/{owner}/{repo}/{branch}/{p}",
-                                "path": p})
+                    out.append({
+                        "name": name,
+                        "download_url": f"https://raw.githubusercontent.com/{owner}/{repo}/{branch}/{p}",
+                        "path": p
+                    })
         return out, {"status": r.status_code, "where": "git_tree", "count": len(out)}
     except Exception as e:
         return [], {"status": "ERR", "where": "git_tree", "error": str(e)}
@@ -174,7 +223,8 @@ def _list_with_html_plain(owner: str, repo: str, path: str, branch: str):
         hrefs = [h for h in hrefs if (not sub) or (f"/{sub}/" in h) or h.endswith("/"+sub)]
         files, seen = [], set()
         for h in hrefs:
-            rel = h.split("/blob/",1)[-1].split("?",1)[0]
+            rel = h.split("/blob/", 1)[-1].split("?", 1)[0]
+            rel = _normalize_rel_for_raw(rel, branch)
             name = rel.split("/")[-1]
             raw  = f"https://raw.githubusercontent.com/{owner}/{repo}/{branch}/{rel}"
             if name.lower().endswith(".csv") and rel not in seen:
@@ -195,7 +245,8 @@ def _list_with_html(owner: str, repo: str, path: str, branch: str):
         hrefs = [h for h in hrefs if (not sub) or (f"/{sub}/" in h) or h.endswith("/"+sub)]
         files, seen = [], set()
         for h in hrefs:
-            rel = h.split("/blob/",1)[-1].split("?",1)[0]
+            rel = h.split("/blob/", 1)[-1].split("?", 1)[0]
+            rel = _normalize_rel_for_raw(rel, branch)
             name = rel.split("/")[-1]
             raw  = f"https://raw.githubusercontent.com/{owner}/{repo}/{branch}/{rel}"
             if name.lower().endswith(".csv") and rel not in seen:
@@ -240,82 +291,6 @@ def github_list_files(owner: str, repo: str, path: str, branch: str):
     debug.append(meta)
     return files, debug
 
-def unit_from_column(df: pd.DataFrame, unit_col: Optional[str], default: str) -> str:
-    if unit_col and unit_col in df.columns:
-        val = df[unit_col].dropna().astype(str)
-        if len(val):
-            return val.iloc[0].strip()
-    return default
-
-def convert_icca_ranges_ppm(ranges_ppm, target_unit, mw):
-    tu = (target_unit or "").lower().replace("ug/m3","µg/m³").replace("ug/m³","µg/m³")
-    out = []
-    for label, color, lo, hi in ranges_ppm:
-        if tu in ["ppm"]:
-            lo2, hi2 = lo, hi
-        elif tu in ["µg/m³", "μg/m³"]:
-            factor = mw * 1000.0 / 24.45
-            lo2 = 0 if (lo == 0) else (None if lo is None else lo*factor)
-            hi2 = math.inf if hi is None or math.isinf(hi) else hi*factor
-        elif tu in ["mg/m³", "mg/m3"]:
-            factor = mw / 24.45
-            lo2 = 0 if (lo == 0) else (None if lo is None else lo*factor)
-            hi2 = math.inf if hi is None or math.isinf(hi) else hi*factor
-        else:
-            lo2, hi2 = lo, hi
-        out.append((label, color, lo2, hi2))
-    return out
-
-def make_bands(x0, x1, ranges, opacity=0.12):
-    shapes, lines = [], []
-    for _, color, lo, hi in ranges:
-        y0 = -math.inf if lo is None else lo
-        y1 =  math.inf if (hi is None or math.isinf(hi)) else hi
-        shapes.append(dict(type="rect", xref="x", yref="y",
-                           x0=x0, x1=x1, y0=y0, y1=y1,
-                           fillcolor=color, opacity=opacity, layer="below", line=dict(width=0)))
-        if hi is not None and not math.isinf(hi):
-            lines.append(dict(type="line", xref="x", yref="y",
-                              x0=x0, x1=x1, y0=hi, y1=hi,
-                              line=dict(color=color, width=1, dash="dot"), layer="below"))
-    return shapes, lines
-
-def make_line_figure(x, y, title, color, y_title, icca_ranges=None, show_icca=True):
-    fig = go.Figure()
-    fig.add_trace(go.Scatter(x=x, y=y, mode="lines", line=dict(color=color)))
-    fig.update_layout(
-        title=title, template="plotly_white",
-        margin=dict(l=20, r=20, t=60, b=30),
-        xaxis_title="Fecha/Hora", yaxis_title=y_title,
-        height=350, legend_title_text=None
-    )
-    if show_icca and icca_ranges:
-        x0, x1 = (pd.Series(x).min(), pd.Series(x).max())
-        shapes, lines = make_bands(x0, x1, icca_ranges, opacity=0.12)
-        fig.update_layout(shapes=shapes + lines)
-    return fig
-
-def make_pm_figure(df, pm_map, pm_band_choice, show_icca=True):
-    fig = go.Figure()
-    for _, label, color in pm_map:
-        lw = 2.5 if label == "PM2.5" else 2
-        fig.add_trace(go.Scatter(x=df["dt"], y=df[label], name=label, mode="lines",
-                                 line=dict(color=color, width=lw)))
-    if show_icca:
-        x0, x1 = df["dt"].min(), df["dt"].max()
-        icca_ranges = ICCA["PM2.5"] if pm_band_choice == "PM2.5" else ICCA["PM10"]
-        shapes, lines = make_bands(x0, x1, icca_ranges, opacity=0.12)
-        fig.update_layout(shapes=shapes + lines)
-    fig.update_layout(
-        title=f"Particulados — PM1 / PM2.5 / PM10 (Bandas ICCA: {pm_band_choice})",
-        template="plotly_white",
-        margin=dict(l=20, r=20, t=60, b=30),
-        xaxis_title="Fecha/Hora", yaxis_title="Concentración (µg/m³)",
-        height=350,
-        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="center", x=0.5),
-    )
-    return fig
-
 # =============================== UI / APP ===============================
 st.set_page_config(page_title="Visor mensual de calidad de aire (GitHub)", layout="wide")
 st.markdown("""
@@ -335,11 +310,12 @@ with st.sidebar:
     path   = st.text_input("Ruta en el repo", value=DEFAULT_PATH_IN_REPO)
     branch = st.text_input("Branch", value=DEFAULT_BRANCH)
 
-    st.caption("También puedes pegar la URL de carpeta (opcional):")
+    st.caption("También puedes pegar la URL de carpeta (acepta /tree/ o /blob/):")
     gh_url = st.text_input("URL de carpeta", value="", placeholder="https://github.com/owner/repo/tree/branch/carpeta")
     if gh_url.strip():
         try:
-            parts = gh_url.strip().split("github.com/")[-1].split("/")
+            url_fixed = _to_tree_url_if_blob(gh_url.strip())
+            parts = url_fixed.split("github.com/")[-1].split("/")
             owner = parts[0]; repo = parts[1]
             idx_tree = parts.index("tree") if "tree" in parts else -1
             if idx_tree != -1 and len(parts) > idx_tree+1:
@@ -350,8 +326,8 @@ with st.sidebar:
 
     st.divider()
     # Plan B: URL directa a un CSV si el listado falla
-    direct_csv_url = st.text_input("Plan B: URL directa a un CSV (raw o blob)", value="",
-                                   placeholder="https://github.com/.../blob/main/datos/device_...csv")
+    direct_csv_url = st.text_input("Plan B: URL directa de un CSV (raw o blob)", value="",
+                                   placeholder="https://github.com/.../blob/main/datosCA/device_...csv")
 
     st.divider()
     show_icca = st.checkbox("Mostrar bandas ICCA", value=True)
@@ -370,19 +346,15 @@ with st.expander("Diagnóstico de listado"):
 
 if not files:
     if direct_csv_url.strip():
-        if "/blob/" in direct_csv_url and "raw.githubusercontent.com" not in direct_csv_url:
-            rel = direct_csv_url.split("/blob/",1)[-1].split("?",1)[0]
-            raw = f"https://raw.githubusercontent.com/{owner}/{repo}/{branch}/{rel}"
-        else:
-            raw = direct_csv_url
-        files = [{"name": raw.split("/")[-1].split("?")[0], "download_url": raw, "path": rel if 'rel' in locals() else raw}]
+        raw = _raw_from_blob_or_raw(owner, repo, branch, direct_csv_url.strip())
+        files = [{"name": raw.split("/")[-1].split("?")[0], "download_url": raw, "path": raw}]
     else:
         st.error(
             "No encontré CSV en esa carpeta.\n"
             "Verifica:\n"
-            "• El *branch* es EXACTAMENTE 'main' (o ajusta el campo Branch).\n"
-            "• Los CSV están dentro de la subcarpeta indicada (p.ej. 'datos/').\n\n"
-            "También puedes pegar la **URL directa** a un CSV en 'Plan B'."
+            "• Branch exacto (p.ej. 'main').\n"
+            "• Subcarpeta correcta (p.ej. 'datosCA').\n\n"
+            "Como alternativa, pega la **URL directa** a un CSV en 'Plan B'."
         )
         st.stop()
 
@@ -526,7 +498,32 @@ for col, label, _ in pm_map:
     data[label] = pd.to_numeric(df_raw[col], errors="coerce")
 df = pd.DataFrame(data).sort_values("dt").reset_index(drop=True)
 
-# ---- Layout centrado: grilla 2x2 ----
+# ---- Gráficas ----
+def make_bands(x0, x1, ranges, opacity=0.12):
+    shapes, lines = [], []
+    for _, color, lo, hi in ranges:
+        y0 = -math.inf if lo is None else lo
+        y1 =  math.inf if (hi is None or math.isinf(hi)) else hi
+        shapes.append(dict(type="rect", xref="x", yref="y",
+                           x0=x0, x1=x1, y0=y0, y1=y1,
+                           fillcolor=color, opacity=opacity, layer="below", line=dict(width=0)))
+        if hi is not None and not math.isinf(hi):
+            lines.append(dict(type="line", xref="x", yref="y",
+                              x0=x0, x1=x1, y0=hi, y1=hi,
+                              line=dict(color=color, width=1, dash="dot"), layer="below"))
+    return shapes, lines
+
+def make_line_figure(x, y, title, color, y_title, icca_ranges=None, show_icca=True):
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(x=x, y=y, mode="lines", line=dict(color=color)))
+    fig.update_layout(title=title, template="plotly_white", margin=dict(l=20, r=20, t=60, b=30),
+                      xaxis_title="Fecha/Hora", yaxis_title=y_title, height=350)
+    if show_icca and icca_ranges:
+        x0, x1 = (pd.Series(x).min(), pd.Series(x).max())
+        shapes, lines = make_bands(x0, x1, icca_ranges, opacity=0.12)
+        fig.update_layout(shapes=shapes + lines)
+    return fig
+
 def plot_pm(df, pm_map, pm_band_choice, show_icca=True):
     fig = go.Figure()
     for _, label, color in pm_map:
@@ -536,7 +533,7 @@ def plot_pm(df, pm_map, pm_band_choice, show_icca=True):
         x0, x1 = df["dt"].min(), df["dt"].max()
         ranges = ICCA["PM2.5"] if pm_band_choice=="PM2.5" else ICCA["PM10"]
         shapes, lines = make_bands(x0, x1, ranges, opacity=0.12)
-        fig.update_layout(shapes=shapes+lines)
+        fig.update_layout(shapes=shapes + lines)
     fig.update_layout(title=f"Particulados — PM1 / PM2.5 / PM10 (Bandas ICCA: {pm_band_choice})",
                       template="plotly_white", margin=dict(l=20,r=20,t=60,b=30),
                       xaxis_title="Fecha/Hora", yaxis_title="Concentración (µg/m³)",
@@ -550,27 +547,26 @@ with center_col:
         st.plotly_chart(plot_pm(df, pm_map, pm_band_choice, True), use_container_width=True)
     with c2:
         no2_icca = convert_icca_ranges_ppm(ICCA["NO2_ppm"], no2_unit, MW["NO2"])
-        st.plotly_chart(make_line_figure(df["dt"], df["NO₂"], f"Dióxido de Nitrógeno — NO₂ ({no2_unit})",
+        st.plotly_chart(make_line_figure(df["dt"], df["NO₂"], f"NO₂ ({no2_unit})",
                                          "#2A9D8F", f"Concentración ({no2_unit})",
                                          icca_ranges=no2_icca, show_icca=True),
                         use_container_width=True)
     c3, c4 = st.columns(2, gap="large")
     with c3:
         so2_icca = convert_icca_ranges_ppm(ICCA["SO2_ppm"], so2_unit, MW["SO2"])
-        st.plotly_chart(make_line_figure(df["dt"], df["SO₂"], f"Dióxido de Azufre — SO₂ ({so2_unit})",
+        st.plotly_chart(make_line_figure(df["dt"], df["SO₂"], f"SO₂ ({so2_unit})",
                                          "#E76F51", f"Concentración ({so2_unit})",
                                          icca_ranges=so2_icca, show_icca=True),
                         use_container_width=True)
     with c4:
         o3_icca = convert_icca_ranges_ppm(ICCA["O3_ppm"], o3_unit, MW["O3"])
-        st.plotly_chart(make_line_figure(df["dt"], df["O₃"], f"Ozono — O₃ ({o3_unit})",
+        st.plotly_chart(make_line_figure(df["dt"], df["O₃"], f"O₃ ({o3_unit})",
                                          "#264653", f"Concentración ({o3_unit})",
                                          icca_ranges=o3_icca, show_icca=True),
                         use_container_width=True)
 
-# Estadísticas rápidas (cadena en una sola línea para evitar SyntaxError)
+# Estadísticas
 with st.expander("Estadísticas del mes (valores originales)"):
-    cols_for_stats = [lab for _, lab, _ in pm_map] + ["NO₃".replace("₃","₂").replace("NO₂","NO₂")]  # mantener consistencia visual
     cols_for_stats = [lab for _, lab, _ in pm_map] + ["NO₂","SO₂","O₃"]
     st.dataframe(
         df[cols_for_stats].describe().T.rename(
