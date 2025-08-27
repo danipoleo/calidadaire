@@ -1,7 +1,6 @@
 # app.py
 # Visor mensual 2x2 (PM1/PM2.5/PM10, NO2, SO2, O3) con bandas ICCA
-# Fuente: carpeta en GitHub (Trees API -> HTML ?plain=1 -> HTML normal -> Contents API)
-# Soporta pegar URL /tree/ o /blob/ y Plan B con CSV directo
+# Fuente: carpeta en GitHub (HTML scraping y/o API) con caché robusto
 
 import io
 import os
@@ -18,7 +17,7 @@ import plotly.graph_objects as go
 # =================== CONFIG POR DEFECTO ===================
 DEFAULT_GITHUB_OWNER = "danipoleo"
 DEFAULT_GITHUB_REPO  = "calidadaire"
-DEFAULT_PATH_IN_REPO = "datos"  # ajusta aquí si cambias carpeta
+DEFAULT_PATH_IN_REPO = "datosCA"  # cambia a "datos" si es tu carpeta
 DEFAULT_BRANCH       = "main"
 # ==========================================================
 
@@ -30,7 +29,7 @@ STATION_MAP: Dict[str, str] = {
     "1762": "Santa Lucía",
     "1775": "Belén CTP",
     "1776": "Fabio Baudrit",
-    "1777": "Municipalidad de Santa Ana",
+    "Z01777": "Municipalidad de Santa Ana",
 }
 
 # Columnas posibles (nombres varían por exporte)
@@ -84,7 +83,6 @@ ICCA: Dict[str, List[Tuple[str, str, float, float]]] = {
 MW = {"NO2": 46.01, "O3": 48.00, "SO2": 64.07, "CO": 28.01}
 
 # ========================== Utilidades ==========================
-
 def _gh_headers() -> Dict[str, str]:
     token = st.secrets.get("GITHUB_TOKEN") or os.environ.get("GITHUB_TOKEN")
     return {"Authorization": f"Bearer {token}"} if token else {}
@@ -159,7 +157,7 @@ def _raw_from_blob_or_raw(owner: str, repo: str, branch: str, url: str) -> str:
         return f"https://raw.githubusercontent.com/{owner}/{repo}/{branch}/{rel}"
     return url.split("?", 1)[0]
 
-# ------------- LISTADO DE ARCHIVOS EN GITHUB (robusto) -------------
+# ------------- LISTADO DE ARCHIVOS EN GITHUB (múltiples estrategias) -------------
 def _list_with_git_tree(owner: str, repo: str, branch: str, subpath: str):
     url = f"https://api.github.com/repos/{owner}/{repo}/git/trees/{branch}?recursive=1"
     try:
@@ -249,16 +247,37 @@ def _list_with_contents_api(owner: str, repo: str, path: str, branch: str):
     except Exception as e:
         return [], {"status": "ERR", "where": "contents_api", "error": str(e)}
 
-@st.cache_data(ttl=300, show_spinner=False)
-def github_list_files(owner: str, repo: str, path: str, branch: str):
+# ---------- Función cacheada de listado (30 minutos) ----------
+@st.cache_data(ttl=1800, show_spinner=False)
+def github_list_files(owner: str, repo: str, path: str, branch: str,
+                      prefer_html: bool, token_present: bool):
     debug = []
-    files, meta = _list_with_git_tree(owner, repo, branch, path); debug.append(meta)
-    if files: return files, debug
-    files, meta = _list_with_html_plain(owner, repo, path, branch); debug.append(meta)
-    if files: return files, debug
-    files, meta = _list_with_html(owner, repo, path, branch); debug.append(meta)
-    if files: return files, debug
-    files, meta = _list_with_contents_api(owner, repo, path, branch); debug.append(meta)
+    files = []
+
+    def try_and_log(fn, *args):
+        f, meta = fn(*args)
+        debug.append(meta)
+        return f
+
+    if prefer_html or not token_present:
+        # Prioriza HTML (no consume API)
+        files = try_and_log(_list_with_html_plain, owner, repo, path, branch)
+        if not files:
+            files = try_and_log(_list_with_html, owner, repo, path, branch)
+        if not files and token_present:
+            files = try_and_log(_list_with_contents_api, owner, repo, path, branch)
+            if not files:
+                files = try_and_log(_list_with_git_tree, owner, repo, branch, path)
+    else:
+        # Con token, intenta API primero
+        files = try_and_log(_list_with_git_tree, owner, repo, branch, path)
+        if not files:
+            files = try_and_log(_list_with_contents_api, owner, repo, path, branch)
+        if not files:
+            files = try_and_log(_list_with_html_plain, owner, repo, path, branch)
+            if not files:
+                files = try_and_log(_list_with_html, owner, repo, path, branch)
+
     return files, debug
 
 # ================ Conversión ICCA (definida ANTES de usarse) ================
@@ -337,7 +356,7 @@ with st.sidebar:
     path   = st.text_input("Ruta en el repo", value=DEFAULT_PATH_IN_REPO)
     branch = st.text_input("Branch", value=DEFAULT_BRANCH)
 
-    st.caption("También puedes pegar la URL de carpeta (acepta /tree/ o /blob/):")
+    st.caption("Pega URL de carpeta (acepta /tree/ o /blob/):")
     gh_url = st.text_input("URL de carpeta", value="", placeholder="https://github.com/owner/repo/tree/branch/carpeta")
     if gh_url.strip():
         try:
@@ -352,31 +371,26 @@ with st.sidebar:
             st.warning("No pude interpretar la URL; usando owner/repo/ruta/branch.")
 
     st.divider()
+    token_present = bool(_gh_headers())
+    prefer_html = st.checkbox("Forzar solo HTML (sin API)", value=(not token_present),
+                              help="Útil si no tienes GITHUB_TOKEN o ves rate limits.")
     direct_csv_url = st.text_input("Plan B: URL directa a un CSV (raw o blob)", value="",
                                    placeholder="https://github.com/.../blob/main/datosCA/device_...csv")
+
     st.divider()
     show_icca = st.checkbox("Mostrar bandas ICCA", value=True)
     pm_band_choice = st.radio("Umbral fondo particulados", ["PM2.5","PM10"], index=0)
+
     if st.button("Recargar / limpiar caché"):
         st.cache_data.clear()
         st.success("Caché limpiada.")
 
-# --- Listar CSV (con diagnóstico) ---
-def _list_all(owner, repo, path, branch):
-    debug = []
-    files, meta = _list_with_git_tree(owner, repo, branch, path); debug.append(meta)
-    if files: return files, debug
-    files, meta = _list_with_html_plain(owner, repo, path, branch); debug.append(meta)
-    if files: return files, debug
-    files, meta = _list_with_html(owner, repo, path, branch); debug.append(meta)
-    if files: return files, debug
-    files, meta = _list_with_contents_api(owner, repo, path, branch); debug.append(meta)
-    return files, debug
-
-files, debug = _list_all(owner, repo, path, branch)
+# --- Listar CSV usando la función CACHEADA y el modo elegido ---
+files, debug = github_list_files(owner, repo, path, branch, prefer_html, token_present)
 
 with st.expander("Diagnóstico de listado"):
-    st.write({"owner": owner, "repo": repo, "path": path, "branch": branch})
+    st.write({"owner": owner, "repo": repo, "path": path, "branch": branch,
+              "prefer_html": prefer_html, "token_present": token_present})
     st.write(debug)
 
 if not files:
@@ -552,7 +566,7 @@ with st.expander("Estadísticas del mes (valores originales)"):
         )[["count","media","desv.std","mín","25%","50%","75%","máx"]]
     )
 
-# Descarga del CSV limpio (sin f-string problemático)
+# Descarga del CSV limpio
 safe_year  = int(subset.iloc[0]['year'])  if pd.notna(subset.iloc[0]['year'])  else None
 safe_month = int(subset.iloc[0]['month']) if pd.notna(subset.iloc[0]['month']) else None
 year_str   = f"{safe_year}"      if safe_year  is not None else "YYYY"
