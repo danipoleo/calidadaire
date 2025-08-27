@@ -121,7 +121,7 @@ ICCA: Dict[str, List[Tuple[str, str, float, float]]] = {
         ("Amarillo",   "#FFC107", 0.066, 0.130),
         ("Anaranjado", "#FF9800", 0.131, 0.195),
         ("Rojo",       "#E53935", 0.196, 0.260),
-        ("Púrpura",    "#8E24AA", 0.260, math.inf),
+        ("Púrpura",    "#8E24AA", 0.260,  math.inf),
     ],
     "CO_ppm": [
         ("Verde",      "#00A65A", 0,     5.50),
@@ -217,64 +217,68 @@ def fetch_csv(url: str) -> pd.DataFrame:
             na_values=["N/A", "NA", "", "null", "None"],
         )
 
-@st.cache_data(ttl=300, show_spinner=False)
-def github_list_files(owner: str, repo: str, path: str, branch: str):
-    """
-    Lista CSV en la carpeta usando la Contents API.
-    Si hay rate limit (403), hace fallback parseando HTML público de GitHub.
-    Devuelve: [{'name': ..., 'download_url': ..., 'path': ...}, ...]
-    """
-    # ---- Intento 1: Contents API ----
+def _list_with_api(owner: str, repo: str, path: str, branch: str):
+    """Devuelve lista con la Contents API o [] si no se puede (no levanta excepción)."""
     url_api = f"https://api.github.com/repos/{owner}/{repo}/contents/{path}?ref={branch}"
     headers = _gh_headers()
     try:
         r = requests.get(url_api, headers=headers, timeout=30)
         if r.status_code == 403:
-            raise requests.HTTPError("403 rate limit", response=r)
+            return []  # rate limit -> sin excepciones
         r.raise_for_status()
         items = r.json()
         if isinstance(items, dict) and items.get("type") == "file":
             items = [items]
-        files = []
-        for it in items:
-            if it.get("type") == "file" and it.get("name", "").lower().endswith(".csv"):
-                files.append({
-                    "name": it["name"],
-                    "download_url": it.get("download_url"),
-                    "path": it.get("path"),
-                })
-        if files:
-            return files
-        # Si no hay CSV, probamos el fallback igual
+        return [
+            {
+                "name": it["name"],
+                "download_url": it.get("download_url"),
+                "path": it.get("path"),
+            }
+            for it in items
+            if it.get("type") == "file" and it.get("name", "").lower().endswith(".csv")
+        ]
     except Exception:
-        pass
+        return []  # cualquier error -> [] y que el caller pruebe el HTML
 
-    # ---- Intento 2: Fallback HTML (sin API) ----
-    # Ej: https://github.com/<owner>/<repo>/tree/<branch>/<path>
+def _list_with_html(owner: str, repo: str, path: str, branch: str):
+    """Parsea la página HTML pública de GitHub para listar CSV (sin API)."""
     url_html = f"https://github.com/{owner}/{repo}/tree/{branch}/{path}".rstrip("/")
-    rh = requests.get(url_html, timeout=30)
-    rh.raise_for_status()
-    html = rh.text
+    try:
+        rh = requests.get(url_html, timeout=30)
+        if rh.status_code >= 400:
+            return []
+        html = rh.text
+        path_prefix = (path.strip("/") + "/") if path.strip("/") else ""
+        pattern = re.compile(
+            rf'href="/{re.escape(owner)}/{re.escape(repo)}/blob/{re.escape(branch)}/({re.escape(path_prefix)}[^"<>]+?\.csv)"'
+        )
+        matches = pattern.findall(html)
+        files, seen = [], set()
+        for rel in matches:
+            if rel in seen:
+                continue
+            seen.add(rel)
+            name = rel.split("/")[-1]
+            raw = f"https://raw.githubusercontent.com/{owner}/{repo}/{branch}/{rel}"
+            files.append({"name": name, "download_url": raw, "path": rel})
+        return files
+    except Exception:
+        return []
 
-    # Buscar anchors de blobs CSV: /<owner>/<repo>/blob/<branch>/<path>/archivo.csv
-    # Tomamos nombre y reconstruimos raw URL.
-    # Admite path vacío (raíz) o con subcarpetas.
-    path_prefix = (path.strip("/") + "/") if path.strip("/") else ""
-    pattern = re.compile(
-        rf'href="/{re.escape(owner)}/{re.escape(repo)}/blob/{re.escape(branch)}/({re.escape(path_prefix)}[^"<>]+?\.csv)"'
-    )
-    matches = pattern.findall(html)
-
+@st.cache_data(ttl=300, show_spinner=False)
+def github_list_files(owner: str, repo: str, path: str, branch: str, force_html: bool = False):
+    """
+    Lista CSV en la carpeta usando:
+    - API (si no hay rate limit) salvo que force_html=True
+    - Fallback HTML si la API no devuelve nada o se pide forzar HTML
+    Nunca levanta excepción; devuelve [] si no encontró nada.
+    """
     files = []
-    seen = set()
-    for rel in matches:
-        if rel in seen:
-            continue
-        seen.add(rel)
-        name = rel.split("/")[-1]
-        raw = f"https://raw.githubusercontent.com/{owner}/{repo}/{branch}/{rel}"
-        files.append({"name": name, "download_url": raw, "path": rel})
-
+    if not force_html:
+        files = _list_with_api(owner, repo, path, branch)
+    if not files:
+        files = _list_with_html(owner, repo, path, branch)
     return files
 
 def raw_url(owner: str, repo: str, path: str, branch: str) -> str:
@@ -381,6 +385,12 @@ with st.sidebar:
     show_icca = st.checkbox("Mostrar bandas ICCA", value=True)
     pm_band_choice = st.radio("Umbral para fondo de particulados", ["PM2.5","PM10"], index=0)
 
+    st.caption("Opciones avanzadas:")
+    force_html = st.checkbox("Forzar fallback (HTML)", value=False)
+    if st.button("Recargar / limpiar caché"):
+        st.cache_data.clear()
+        st.success("Caché limpiada. Vuelve a seleccionar opciones si es necesario.")
+
     st.caption("También puedes pegar la URL de carpeta (opcional):")
     gh_url = st.text_input("URL de carpeta (opcional)", value="", placeholder="https://github.com/owner/repo/tree/branch/carpeta")
     if gh_url.strip():
@@ -394,15 +404,14 @@ with st.sidebar:
         except Exception:
             st.warning("No pude interpretar la URL; usando los campos owner/repo/ruta/branch.")
 
-# --- Listar archivos CSV en la carpeta (API -> fallback HTML) ---
-try:
-    files = github_list_files(owner, repo, path, branch)
-except Exception as e:
-    st.error(f"No pude listar la carpeta en GitHub ({owner}/{repo}/{path}@{branch}). Detalle: {e}")
-    st.stop()
+# --- Listar archivos CSV (API -> fallback HTML, sin excepciones) ---
+files = github_list_files(owner, repo, path, branch, force_html=force_html)
 
 if not files:
-    st.error("No encontré CSV en esa carpeta del repositorio. Verifica owner/repo/ruta/branch.")
+    st.error(
+        "No encontré CSV en esa carpeta del repositorio.\n"
+        "Si ves límites de GitHub, prueba 'Forzar fallback (HTML)' o agrega un GITHUB_TOKEN en Secrets."
+    )
     st.stop()
 
 # Construir índice e intentar parsear año/mes del nombre
@@ -416,7 +425,7 @@ for f in files:
     station = STATION_MAP.get(sid, sid if sid else "Desconocida")
     rows.append({
         "name": fname,
-        "url": f.get("download_url") or raw_url(owner, repo, f.get("path",""), branch),
+        "url": f.get("download_url") or f"https://raw.githubusercontent.com/{owner}/{repo}/{branch}/{f.get('path','')}",
         "sid": sid,
         "station": station,
         "dt_start": meta["dt_start"],
@@ -601,13 +610,10 @@ st.download_button(
 
 with st.expander("Ayuda / Supuestos"):
     st.markdown(f"""
-- Fuente: Contents API → si hay **rate limit**, se usa fallback HTML (página pública del repo) para listar CSV y construir **raw URLs**.
+- Para evitar límites, agrega **GITHUB_TOKEN** en *Settings → Secrets* (PAT de solo lectura).  
+- Si ves rate limit, usa **“Forzar fallback (HTML)”** o pulsa **“Recargar / limpiar caché”**.
 - Limpieza EarthSense: se descartan metadatos superiores hasta la fila con **Date (Local)** y **UTC Time Stamp**.
 - Detección de tiempo: **UTC Time Stamp** si existe; si no, **Date (Local) + Time (Local)** (`dayfirst=True`).
-- **Bandas ICCA**:
-  - **Particulados** (PM10 y PM2.5) en **µg/m³** (rangos incluidos en el código).
-  - **Gases (NO₂, O₃, SO₂)**: ICCA en **ppm**, convertido automáticamente a la **unidad del CSV**:
-    - NO₂ ({no2_unit}), O₃ ({o3_unit}), SO₂ ({so2_unit}); CO soportado si está en el CSV.
+- **Bandas ICCA**: particulados (PM10/PM2.5) en µg/m³; gases (NO₂/O₃/SO₂) a ppm convertidos a la unidad del CSV.
 - Conversión (25°C, 1 atm): µg/m³ = ppm × MW × 1000 / 24.45; mg/m³ = ppm × MW / 24.45.
-- Si el nombre del archivo cumple `device_<id>_<YYYYMMDDHHMM>_<YYYYMMDDHHMM>_1hr.csv`, se usa para inferir Año/Mes; de lo contrario, se estima desde las fechas del CSV.
 """)
