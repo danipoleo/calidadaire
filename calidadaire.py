@@ -216,7 +216,7 @@ def _list_with_html(owner: str, repo: str, path: str, branch: str):
             return [], {"status": r.status_code, "where": "html"}
         hrefs = _extract_csv_links(r.text)
         sub = path.strip("/")
-        hrefs = [h for h in hrefs si (not sub) or (f"/{sub}/" in h) or h.endswith("/"+sub)]
+        hrefs = [h for h in hrefs if (not sub) or (f"/{sub}/" in h) or h.endswith("/"+sub)]
         files, seen = [], set()
         for h in hrefs:
             rel = h.split("/blob/", 1)[-1].split("?", 1)[0]
@@ -344,7 +344,7 @@ with st.sidebar:
             url_fixed = _to_tree_url_if_blob(gh_url.strip())
             parts = url_fixed.split("github.com/")[-1].split("/")
             owner = parts[0]; repo = parts[1]
-            idx_tree = parts.index("tree") si "tree" in parts else -1
+            idx_tree = parts.index("tree") if "tree" in parts else -1
             if idx_tree != -1 and len(parts) > idx_tree+1:
                 branch = parts[idx_tree+1]
                 path = "/".join(parts[idx_tree+2:]) if len(parts) > idx_tree+2 else ""
@@ -548,11 +548,11 @@ with st.expander("Estadísticas del mes (valores originales)"):
     cols_for_stats = [lab for _, lab, _ in pm_map] + ["NO₂","SO₂","O₃"]
     st.dataframe(
         df[cols_for_stats].describe().T.rename(
-            columns={"mean":"media", "std":"desv.std", "min":"mín", "max":"máx"}
+            columns={"mean":"media","std":"desv.std","min":"mín","max":"máx"}
         )[["count","media","desv.std","mín","25%","50%","75%","máx"]]
     )
 
-# Descarga del CSV limpio (arreglo del f-string)
+# Descarga del CSV limpio (sin f-string problemático)
 safe_year  = int(subset.iloc[0]['year'])  if pd.notna(subset.iloc[0]['year'])  else None
 safe_month = int(subset.iloc[0]['month']) if pd.notna(subset.iloc[0]['month']) else None
 year_str   = f"{safe_year}"      if safe_year  is not None else "YYYY"
