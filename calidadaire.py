@@ -216,7 +216,7 @@ def _list_with_html(owner: str, repo: str, path: str, branch: str):
             return [], {"status": r.status_code, "where": "html"}
         hrefs = _extract_csv_links(r.text)
         sub = path.strip("/")
-        hrefs = [h for h in hrefs if (not sub) or (f"/{sub}/" in h) or h.endswith("/"+sub)]
+        hrefs = [h for h in hrefs si (not sub) or (f"/{sub}/" in h) or h.endswith("/"+sub)]
         files, seen = [], set()
         for h in hrefs:
             rel = h.split("/blob/", 1)[-1].split("?", 1)[0]
@@ -252,25 +252,17 @@ def _list_with_contents_api(owner: str, repo: str, path: str, branch: str):
 @st.cache_data(ttl=300, show_spinner=False)
 def github_list_files(owner: str, repo: str, path: str, branch: str):
     debug = []
-    files, meta = _list_with_git_tree(owner, repo, branch, path)
-    debug.append(meta)
+    files, meta = _list_with_git_tree(owner, repo, branch, path); debug.append(meta)
     if files: return files, debug
-    files, meta = _list_with_html_plain(owner, repo, path, branch)
-    debug.append(meta)
+    files, meta = _list_with_html_plain(owner, repo, path, branch); debug.append(meta)
     if files: return files, debug
-    files, meta = _list_with_html(owner, repo, path, branch)
-    debug.append(meta)
+    files, meta = _list_with_html(owner, repo, path, branch); debug.append(meta)
     if files: return files, debug
-    files, meta = _list_with_contents_api(owner, repo, path, branch)
-    debug.append(meta)
+    files, meta = _list_with_contents_api(owner, repo, path, branch); debug.append(meta)
     return files, debug
 
-# ================ Conversión ICCA (¡definida ANTES de usarse!) ================
+# ================ Conversión ICCA (definida ANTES de usarse) ================
 def convert_icca_ranges_ppm(ranges_ppm, target_unit, mw):
-    """
-    Convierte rangos ICCA definidos en ppm a la unidad objetivo (ppm / µg/m³ / mg/m³).
-    Se usa para NO2, SO2, O3, CO.
-    """
     tu = (target_unit or "").lower().replace("ug/m3","µg/m³").replace("ug/m³","µg/m³")
     out = []
     for label, color, lo, hi in ranges_ppm:
@@ -352,7 +344,7 @@ with st.sidebar:
             url_fixed = _to_tree_url_if_blob(gh_url.strip())
             parts = url_fixed.split("github.com/")[-1].split("/")
             owner = parts[0]; repo = parts[1]
-            idx_tree = parts.index("tree") if "tree" in parts else -1
+            idx_tree = parts.index("tree") si "tree" in parts else -1
             if idx_tree != -1 and len(parts) > idx_tree+1:
                 branch = parts[idx_tree+1]
                 path = "/".join(parts[idx_tree+2:]) if len(parts) > idx_tree+2 else ""
@@ -499,16 +491,16 @@ if len(pm_map)==0:
     st.error("No se encontraron columnas de particulado (PM1/PM2.5/PM10) en el CSV."); st.stop()
 
 # Unidades
-def unit_from_column(df, unit_col, default):
+def unit_from_column2(df, unit_col, default):
     if unit_col and unit_col in df.columns:
         v = df[unit_col].dropna().astype(str)
         if len(v): return v.iloc[0].strip()
     return default
 
-no2_unit = unit_from_column(df_raw, unit_cols.get("NO2"), "µg/m³")
-o3_unit  = unit_from_column(df_raw, unit_cols.get("O3"),  "µg/m³")
-so2_unit = unit_from_column(df_raw, unit_cols.get("SO2"), "µg/m³")
-co_unit  = unit_from_column(df_raw, unit_cols.get("CO"),  "mg/m³")
+no2_unit = unit_from_column2(df_raw, unit_cols.get("NO2"), "µg/m³")
+o3_unit  = unit_from_column2(df_raw, unit_cols.get("O3"),  "µg/m³")
+so2_unit = unit_from_column2(df_raw, unit_cols.get("SO2"), "µg/m³")
+co_unit  = unit_from_column2(df_raw, unit_cols.get("CO"),  "mg/m³")
 
 # DataFrame final
 data = {"dt": dt,
@@ -556,13 +548,16 @@ with st.expander("Estadísticas del mes (valores originales)"):
     cols_for_stats = [lab for _, lab, _ in pm_map] + ["NO₂","SO₂","O₃"]
     st.dataframe(
         df[cols_for_stats].describe().T.rename(
-            columns={"mean":"media","std":"desv.std","min":"mín","max":"máx"}
+            columns={"mean":"media", "std":"desv.std", "min":"mín", "max":"máx"}
         )[["count","media","desv.std","mín","25%","50%","75%","máx"]]
     )
 
-# Descarga del CSV limpio
+# Descarga del CSV limpio (arreglo del f-string)
 safe_year  = int(subset.iloc[0]['year'])  if pd.notna(subset.iloc[0]['year'])  else None
 safe_month = int(subset.iloc[0]['month']) if pd.notna(subset.iloc[0]['month']) else None
-file_stub  = f"clean_{row.get('sid') or 'NA'}_{safe_year or 'YYYY'}{(safe_month or 0):02d if safe_month else 'MM'}"
+year_str   = f"{safe_year}"      if safe_year  is not None else "YYYY"
+month_str  = f"{safe_month:02d}" if safe_month is not None else "MM"
+sid_str    = row.get('sid') or 'NA'
+file_stub  = f"clean_{sid_str}_{year_str}{month_str}"
 st.download_button("Descargar CSV limpio (este archivo)", data=df.to_csv(index=False),
                    file_name=f"{file_stub}.csv", mime="text/csv")
