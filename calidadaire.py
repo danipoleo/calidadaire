@@ -1,6 +1,6 @@
 # app.py
 # Visor mensual 2x2 con bandas ICCA (PM1/PM2.5/PM10, NO2, SO2, O3)
-# Fuente: carpeta de GitHub (Contents API / raw URLs)
+# Fuente: carpeta de GitHub (Contents API -> fallback HTML -> raw URLs)
 # Requisitos: streamlit, pandas, plotly, requests, python-dateutil (implícito)
 
 import io
@@ -219,23 +219,62 @@ def fetch_csv(url: str) -> pd.DataFrame:
 
 @st.cache_data(ttl=300, show_spinner=False)
 def github_list_files(owner: str, repo: str, path: str, branch: str):
-    """Lista archivos (GitHub contents API) en una carpeta."""
-    url = f"https://api.github.com/repos/{owner}/{repo}/contents/{path}?ref={branch}"
-    r = requests.get(url, headers=_gh_headers(), timeout=30)
-    if r.status_code == 403:
-        st.warning("Límite de API de GitHub alcanzado. Agrega un GITHUB_TOKEN en Secrets si es posible.")
-    r.raise_for_status()
-    items = r.json()
-    if isinstance(items, dict) and items.get("type") == "file":
-        items = [items]
+    """
+    Lista CSV en la carpeta usando la Contents API.
+    Si hay rate limit (403), hace fallback parseando HTML público de GitHub.
+    Devuelve: [{'name': ..., 'download_url': ..., 'path': ...}, ...]
+    """
+    # ---- Intento 1: Contents API ----
+    url_api = f"https://api.github.com/repos/{owner}/{repo}/contents/{path}?ref={branch}"
+    headers = _gh_headers()
+    try:
+        r = requests.get(url_api, headers=headers, timeout=30)
+        if r.status_code == 403:
+            raise requests.HTTPError("403 rate limit", response=r)
+        r.raise_for_status()
+        items = r.json()
+        if isinstance(items, dict) and items.get("type") == "file":
+            items = [items]
+        files = []
+        for it in items:
+            if it.get("type") == "file" and it.get("name", "").lower().endswith(".csv"):
+                files.append({
+                    "name": it["name"],
+                    "download_url": it.get("download_url"),
+                    "path": it.get("path"),
+                })
+        if files:
+            return files
+        # Si no hay CSV, probamos el fallback igual
+    except Exception:
+        pass
+
+    # ---- Intento 2: Fallback HTML (sin API) ----
+    # Ej: https://github.com/<owner>/<repo>/tree/<branch>/<path>
+    url_html = f"https://github.com/{owner}/{repo}/tree/{branch}/{path}".rstrip("/")
+    rh = requests.get(url_html, timeout=30)
+    rh.raise_for_status()
+    html = rh.text
+
+    # Buscar anchors de blobs CSV: /<owner>/<repo>/blob/<branch>/<path>/archivo.csv
+    # Tomamos nombre y reconstruimos raw URL.
+    # Admite path vacío (raíz) o con subcarpetas.
+    path_prefix = (path.strip("/") + "/") if path.strip("/") else ""
+    pattern = re.compile(
+        rf'href="/{re.escape(owner)}/{re.escape(repo)}/blob/{re.escape(branch)}/({re.escape(path_prefix)}[^"<>]+?\.csv)"'
+    )
+    matches = pattern.findall(html)
+
     files = []
-    for it in items:
-        if it.get("type") == "file" and it.get("name", "").lower().endswith(".csv"):
-            files.append({
-                "name": it["name"],
-                "download_url": it.get("download_url"),
-                "path": it.get("path"),
-            })
+    seen = set()
+    for rel in matches:
+        if rel in seen:
+            continue
+        seen.add(rel)
+        name = rel.split("/")[-1]
+        raw = f"https://raw.githubusercontent.com/{owner}/{repo}/{branch}/{rel}"
+        files.append({"name": name, "download_url": raw, "path": rel})
+
     return files
 
 def raw_url(owner: str, repo: str, path: str, branch: str) -> str:
@@ -355,7 +394,7 @@ with st.sidebar:
         except Exception:
             st.warning("No pude interpretar la URL; usando los campos owner/repo/ruta/branch.")
 
-# --- Listar archivos CSV en la carpeta (robusto) ---
+# --- Listar archivos CSV en la carpeta (API -> fallback HTML) ---
 try:
     files = github_list_files(owner, repo, path, branch)
 except Exception as e:
@@ -562,8 +601,8 @@ st.download_button(
 
 with st.expander("Ayuda / Supuestos"):
     st.markdown(f"""
-- Fuente: GitHub contents API → descarga directa **raw** (usa `GITHUB_TOKEN` si está disponible para evitar límites).
-- Limpieza EarthSense: se descartan metadatos superiores hasta encontrar la fila con **Date (Local)** y **UTC Time Stamp**.
+- Fuente: Contents API → si hay **rate limit**, se usa fallback HTML (página pública del repo) para listar CSV y construir **raw URLs**.
+- Limpieza EarthSense: se descartan metadatos superiores hasta la fila con **Date (Local)** y **UTC Time Stamp**.
 - Detección de tiempo: **UTC Time Stamp** si existe; si no, **Date (Local) + Time (Local)** (`dayfirst=True`).
 - **Bandas ICCA**:
   - **Particulados** (PM10 y PM2.5) en **µg/m³** (rangos incluidos en el código).
